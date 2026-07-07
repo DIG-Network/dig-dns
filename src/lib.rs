@@ -12,16 +12,25 @@
 //! still loads when one path is blocked (e.g. a browser forcing DNS-over-HTTPS).
 //!
 //! ## Module map
-//! - [`label`] — the base32 DNS-label ↔ 32-byte-storeId codec (Phase 1).
+//! - [`label`] — the base32 DNS-label ↔ 32-byte-storeId codec.
+//! - [`host`] — parse a `.dig` request host into a [`host::HostTarget`]: `<storeId>.dig`
+//!   (latest root) or `<rootId>.<storeId>.dig` (a pinned-root capsule).
+//! - [`content`] — the read path: HTTP path → resource_key → retrieval_key, and the
+//!   verify-then-decrypt pipeline (byte-identical to `digstore-core` / `dig-client-wasm`).
+//! - [`node`] — the dig-node read contract: JSON-RPC param builders, response parsing,
+//!   windowed-content reassembly, and the §5.3 endpoint-ladder ordering.
 //! - [`config`] — service configuration: loopback IP / ports / TLD / node endpoint,
-//!   with flag → env → file override precedence (Phase 1).
-//! - [`cli`] — the `dig-dns` binary's command surface (Phase 1; grows per phase).
+//!   with flag → env → file override precedence.
+//! - [`cli`] — the `dig-dns` binary's command surface (grows per phase).
 //!
-//! The gateway, DNS responder, `doctor`, and PAC generator land in later phases; each is
-//! its own module here so the binary stays a thin shell over a fully unit-tested library.
+//! The HTTP gateway server, DNS responder, `doctor`, and PAC generator land in later phases,
+//! composing these modules; the binary stays a thin shell over a fully unit-tested library.
 //!
 //! The contract this library implements is normative in `SPEC.md`.
 
 pub mod cli;
 pub mod config;
+pub mod content;
+pub mod host;
 pub mod label;
+pub mod node;
