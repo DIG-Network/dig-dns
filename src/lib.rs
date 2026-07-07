@@ -24,21 +24,24 @@
 //!   trait the gateway serves against.
 //! - [`gateway`] — the HTTP gateway request logic: classify (origin/absolute-proxy/CONNECT/
 //!   control), the never-an-open-proxy rules, `/.dig/` control endpoints, and resolve+serve.
-//! - [`server`] — the hyper listener glue: bind (with the `:8053` fallback), accept, and adapt
-//!   hyper requests to [`gateway::handle`].
+//! - [`dns`] — the DNS responder wire codec + answering policy (PURE): `*.<tld>`/apex → `A`
+//!   loopback, AAAA/other → NODATA, non-`.<tld>` → REFUSED, EDNS0/TC (SPEC §3).
+//! - [`server`] — the listener glue: bind the gateway (with the `:8053` fallback) + the DNS
+//!   responder (`:53`, UDP+TCP), accept, and adapt hyper requests to [`gateway::handle`].
 //! - [`pac`] — Proxy Auto-Config generation for Path B (the PAC control endpoint + CLI).
 //! - [`config`] — service configuration: loopback IP / ports / TLD / node endpoint,
 //!   with flag → env → file override precedence.
 //! - [`cli`] — the `dig-dns` binary's command surface (grows per phase).
 //!
-//! The DNS responder (Phase 3) and `doctor` (Phase 4) land in later phases, composing these
-//! modules; the binary stays a thin shell over a fully unit-tested library.
+//! `doctor` (Phase 4) + the PAC CLI (Phase 5) land in later phases, composing these modules;
+//! the binary stays a thin shell over a fully unit-tested library.
 //!
 //! The contract this library implements is normative in `SPEC.md`.
 
 pub mod cli;
 pub mod config;
 pub mod content;
+pub mod dns;
 pub mod gateway;
 pub mod host;
 pub mod label;

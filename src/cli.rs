@@ -46,8 +46,9 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Run the HTTP gateway on the loopback IP (binds `:80`, deterministic fallback `:8053`).
-    /// Serves `.dig` content resolved from a dig-node; runs until Ctrl-C.
+    /// Run the resolver service on the loopback IP: the HTTP gateway (`:80`, fallback `:8053`)
+    /// AND the DNS responder (`:53`, best-effort). Serves `.dig` content from a dig-node; runs
+    /// until Ctrl-C.
     Serve {
         /// Explicit dig-node endpoint (highest precedence; else the §5.3 ladder
         /// dig.local → localhost:9778 → rpc.dig.net).
@@ -204,7 +205,7 @@ pub fn run() -> std::process::ExitCode {
                 Ok(rt) => rt,
                 Err(e) => return fail(&e.to_string()),
             };
-            match rt.block_on(crate::server::run_gateway(cfg)) {
+            match rt.block_on(crate::server::run_service(cfg)) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(&e.to_string()),
             }
