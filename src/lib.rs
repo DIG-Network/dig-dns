@@ -17,20 +17,32 @@
 //!   (latest root) or `<rootId>.<storeId>.dig` (a pinned-root capsule).
 //! - [`content`] — the read path: HTTP path → resource_key → retrieval_key, and the
 //!   verify-then-decrypt pipeline (byte-identical to `digstore-core` / `dig-client-wasm`).
-//! - [`node`] — the dig-node read contract: JSON-RPC param builders, response parsing,
+//! - [`node`] — the dig-node read contract (PURE): JSON-RPC param builders, response parsing,
 //!   windowed-content reassembly, and the §5.3 endpoint-ladder ordering.
+//! - [`transport`] — the async dig-node client behind [`node`]: the `reqwest` JSON-RPC client
+//!   (`ReqwestNodeClient`) that walks the ladder + pages content, and the [`transport::NodeClient`]
+//!   trait the gateway serves against.
+//! - [`gateway`] — the HTTP gateway request logic: classify (origin/absolute-proxy/CONNECT/
+//!   control), the never-an-open-proxy rules, `/.dig/` control endpoints, and resolve+serve.
+//! - [`server`] — the hyper listener glue: bind (with the `:8053` fallback), accept, and adapt
+//!   hyper requests to [`gateway::handle`].
+//! - [`pac`] — Proxy Auto-Config generation for Path B (the PAC control endpoint + CLI).
 //! - [`config`] — service configuration: loopback IP / ports / TLD / node endpoint,
 //!   with flag → env → file override precedence.
 //! - [`cli`] — the `dig-dns` binary's command surface (grows per phase).
 //!
-//! The HTTP gateway server, DNS responder, `doctor`, and PAC generator land in later phases,
-//! composing these modules; the binary stays a thin shell over a fully unit-tested library.
+//! The DNS responder (Phase 3) and `doctor` (Phase 4) land in later phases, composing these
+//! modules; the binary stays a thin shell over a fully unit-tested library.
 //!
 //! The contract this library implements is normative in `SPEC.md`.
 
 pub mod cli;
 pub mod config;
 pub mod content;
+pub mod gateway;
 pub mod host;
 pub mod label;
 pub mod node;
+pub mod pac;
+pub mod server;
+pub mod transport;
