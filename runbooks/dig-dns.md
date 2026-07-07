@@ -30,19 +30,30 @@ dig-dns serve [--node <URL>]               # run the HTTP gateway (Ctrl-C to sto
 dig-dns fetch <host|url> [path] [--json]    # one-shot: resolve a .dig resource + print it
 ```
 
-**HTTP gateway (`serve`).** Binds `127.0.0.5:80` (deterministic fallback `127.0.0.5:8053` when
-`:80` is held — logged loudly + reported by `/.dig/health`). Binding `:80` on the dedicated
-loopback IP requires elevation / `CAP_NET_BIND_SERVICE` and that `127.0.0.5` be up (the
-installer, Component B, arranges both). For an unprivileged local run, override the bind:
+**Service (`serve`).** Runs BOTH resolution paths on the dedicated loopback IP:
+
+- **HTTP gateway** — `127.0.0.5:80` (deterministic fallback `127.0.0.5:8053` when `:80` is held
+  — logged loudly + reported by `/.dig/health`).
+- **DNS responder** — `127.0.0.5:53` (UDP + TCP): `*.dig`/apex → `A 127.0.0.5` (TTL 2s,
+  0x20-preserved), `AAAA`/other types → NODATA, non-`.dig` → REFUSED, EDNS0/TC → TCP fallback.
+
+Binding `:53` and `:80` on the dedicated IP requires elevation / `CAP_NET_BIND_SERVICE` and that
+`127.0.0.5` be up (the installer, Component B, arranges both). The two paths are **independent**:
+if the DNS `:53` bind fails (unprivileged, or `:53` held), `serve` logs a warning and continues
+gateway-only (Path B via the PAC still serves `.dig`); `/.dig/health` reports `paths.dns`. For an
+unprivileged local run, override the binds:
 
 ```sh
-DIG_DNS_IP=127.0.0.1 DIG_DNS_HTTP_PORT=8080 dig-dns serve --node http://localhost:9778
+DIG_DNS_IP=127.0.0.1 DIG_DNS_HTTP_PORT=8080 DIG_DNS_DNS_PORT=5353 \
+  dig-dns serve --node http://localhost:9778
 # then, in another shell:
-curl -s http://127.0.0.1:8080/.dig/health | jq .          # service state
+curl -s http://127.0.0.1:8080/.dig/health | jq .          # service state (paths.dns, bound_port)
 curl -s http://127.0.0.1:8080/.dig/proxy.pac              # PAC (advertises the bound port)
 curl -H 'Host: <label>.dig' http://127.0.0.1:8080/        # origin-form (Path A)
 curl -x http://127.0.0.1:8080 http://<label>.dig/         # absolute-form proxy (Path B)
 dig-dns fetch <label>.dig / --node http://localhost:9778  # curl-free fetch
+dig @127.0.0.1 -p 5353 <label>.dig                        # DNS: A 127.0.0.5 (needs BIND tools)
+# Windows without BIND tools: Resolve-DnsName -Server 127.0.0.5 <label>.dig
 ```
 
 Control endpoints (also directly on the IP): `GET /.dig/health` (JSON), `GET /.dig/proxy.pac`
@@ -56,7 +67,7 @@ content + pinned-vs-latest checks). The Rust integration test `tests/gateway_stu
 all of it deterministically (both request forms, SPA, ranges, and the pinned-vs-latest proof)
 against a stub node.
 
-The DNS responder (`serve` will also bind `127.0.0.5:53`) and `doctor` land in Phases 3–4.
+`doctor` (Phase 4) + the PAC CLI (Phase 5) land next.
 
 **Config** is defaults + environment overrides (see `SPEC.md §7`): `DIG_DNS_IP`,
 `DIG_DNS_DNS_PORT`, `DIG_DNS_HTTP_PORT`, `DIG_DNS_HTTP_FALLBACK_PORT`, `DIG_DNS_TLD`,

@@ -67,3 +67,31 @@ requires a scheme before treating a `fetch` target as a full URL.
 Setting `.header("host", "<label>.dig")` on a reqwest request to the gateway's real
 `127.0.0.1:<port>` address sends origin-form with that Host — so Path A (origin-form) is testable
 over a real socket without OS DNS. Path B is tested via `reqwest::Proxy::http(gateway)`.
+
+## DNS responder: hand-rolled codec, constant-time wildcard
+
+The `.dig` DNS answer is a constant `A <loopback_ip>` (or NODATA/REFUSED), so a full DNS library
+is unnecessary — a single-question parser + a compression-pointer answer suffices and is
+byte-level testable. Key details:
+
+- The answer RR name is a compression pointer `0xC0 0x0C` → offset 12 (the question always starts
+  right after the 12-byte header), so we never re-encode the name.
+- **0x20 case preservation**: echo the request's raw question bytes verbatim (`msg[12..q_end]`)
+  into the response — do NOT re-encode from the decoded labels.
+- Answer `A` for a `.dig` name of **any base32-label validity** (DNS stays a cheap wildcard; the
+  gateway does the 404 for a bad label). "Under the TLD" = the LAST label equals the tld
+  (case-insensitive) — so `dig`/`x.dig`/`a.b.dig` match but `digfoo` and `x.com` do not.
+- EDNS0 OPT is echoed (root name + type 41). TC only fires when a UDP response exceeds the
+  advertised payload size — with our ~tiny answers that never happens for real 512+ clients, so
+  TC is tested by crafting a query advertising a sub-response EDNS size.
+- DNS-over-TCP is length-prefixed (2-byte big-endian length) and never truncates.
+
+## `serve` runs BOTH paths; the DNS bind is non-fatal
+
+`server::run_service` brings up the gateway AND the DNS responder. The two resolution paths are
+independent, so a `:53` bind failure (unprivileged run, or `:53` already held) is logged and
+`serve` continues **gateway-only** — Path B (the PAC proxy) still serves `.dig`. `/.dig/health`
+`paths.dns` reflects whether the responder actually bound. For a local unprivileged run, override
+`DIG_DNS_IP=127.0.0.1` + high `DIG_DNS_DNS_PORT`/`DIG_DNS_HTTP_PORT`. (Do NOT smoke-test `serve`
+by backgrounding it from the Bash tool on Windows — the process is not reaped and hangs the
+shell; the socket integration tests are the real evidence.)
