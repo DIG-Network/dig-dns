@@ -10,7 +10,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -298,6 +298,27 @@ pub async fn run_service(config: Config) -> Result<(), ServerError> {
     })
     .await;
     Ok(())
+}
+
+/// Probe a running gateway for its actually-bound port: try `/.dig/resolve-probe` on the
+/// primary then the fallback, returning the first that answers `204`. Used by `dig-dns pac` to
+/// emit a PAC file advertising the real bound port (which may be the `:8053` fallback). Returns
+/// `None` when no gateway is running.
+pub async fn probe_gateway_port(ip: Ipv4Addr, primary: u16, fallback: u16) -> Option<u16> {
+    crate::transport::init_crypto();
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .ok()?;
+    for port in [primary, fallback] {
+        let url = format!("http://{ip}:{port}/.dig/resolve-probe");
+        if let Ok(resp) = http.get(&url).send().await {
+            if resp.status().as_u16() == 204 {
+                return Some(port);
+            }
+        }
+    }
+    None
 }
 
 /// Split a `fetch` target into `(host, path)`. Accepts a full `http(s)://host/path` URL, a

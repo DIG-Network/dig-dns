@@ -102,6 +102,16 @@ paths would only be compiled by the release matrix, not ubuntu CI clippy — a r
 checked everywhere and a missing tool just degrades to "unknown"). Gotcha: a `:80` port-holder
 substring match hits `:8000`/`:8080` — require the char after `:{port}` to be a non-digit.
 
+## `dig-dns pac` embeds the ACTUAL bound port
+
+The PAC must advertise the port the gateway actually bound (which may be the `:8053` fallback).
+`dig-dns pac` uses `--port` if given, else PROBES the running gateway (`server::probe_gateway_port`
+tries `/.dig/resolve-probe` on primary then fallback), else the configured `http_port`. The
+running gateway's own `/.dig/proxy.pac` endpoint is the other source (it already knows its bound
+port). Windows gotcha: `Invoke-WebRequest` returns `.Content` as BYTES for the PAC's
+`application/x-ns-proxy-autoconfig` content-type — use `.RawContent` (always a string) when
+grepping PAC output in PowerShell.
+
 ## `serve` runs BOTH paths; the DNS bind is non-fatal
 
 `server::run_service` brings up the gateway AND the DNS responder. The two resolution paths are
