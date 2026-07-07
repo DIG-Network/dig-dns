@@ -28,6 +28,8 @@
 //!   loopback, AAAA/other → NODATA, non-`.<tld>` → REFUSED, EDNS0/TC (SPEC §3).
 //! - [`server`] — the listener glue: bind the gateway (with the `:8053` fallback) + the DNS
 //!   responder (`:53`, UDP+TCP), accept, and adapt hyper requests to [`gateway::handle`].
+//! - [`doctor`] — the `doctor` diagnostic (SPEC §9): independent per-link checks of both paths
+//!   with fix hints + `--json`, exiting non-zero when a `.dig` URL cannot load.
 //! - [`pac`] — Proxy Auto-Config generation for Path B (the PAC control endpoint + CLI).
 //! - [`config`] — service configuration: loopback IP / ports / TLD / node endpoint,
 //!   with flag → env → file override precedence.
@@ -42,6 +44,7 @@ pub mod cli;
 pub mod config;
 pub mod content;
 pub mod dns;
+pub mod doctor;
 pub mod gateway;
 pub mod host;
 pub mod label;

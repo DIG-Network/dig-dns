@@ -26,9 +26,17 @@ cargo llvm-cov --fail-under-lines 80 --summary-only
 dig-dns label encode <64-hex-store-id>     # -> <base32>.dig
 dig-dns label decode <label|host>          # -> <64-hex>
 dig-dns config [--json]                     # resolved config
-dig-dns serve [--node <URL>]               # run the HTTP gateway (Ctrl-C to stop)
+dig-dns serve [--node <URL>]               # run the gateway + DNS responder (Ctrl-C to stop)
 dig-dns fetch <host|url> [path] [--json]    # one-shot: resolve a .dig resource + print it
+dig-dns doctor [--json]                     # diagnose both paths; nonzero if no path can load
 ```
+
+**`doctor`** checks each link of both resolution paths independently and prints pass/fail + a
+fix hint (exit non-zero when a `.dig` URL cannot load): loopback IP up, DNS responder answers
+directly, OS routes `.dig` to the loopback IP (Path A), the gateway answers (Path B, primary vs
+`:8053` fallback), the gateway can reach a dig-node, the browser DoH/built-in-resolver policy
+(informational — explains Path A bypass), and who holds `:80`. `--json` for machine consumption.
+Run it to triage after an install.
 
 **Service (`serve`).** Runs BOTH resolution paths on the dedicated loopback IP:
 
@@ -67,7 +75,7 @@ content + pinned-vs-latest checks). The Rust integration test `tests/gateway_stu
 all of it deterministically (both request forms, SPA, ranges, and the pinned-vs-latest proof)
 against a stub node.
 
-`doctor` (Phase 4) + the PAC CLI (Phase 5) land next.
+The PAC CLI + README + per-OS acceptance scripts (Phase 5) land next.
 
 **Config** is defaults + environment overrides (see `SPEC.md §7`): `DIG_DNS_IP`,
 `DIG_DNS_DNS_PORT`, `DIG_DNS_HTTP_PORT`, `DIG_DNS_HTTP_FALLBACK_PORT`, `DIG_DNS_TLD`,

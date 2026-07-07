@@ -86,6 +86,22 @@ byte-level testable. Key details:
   TC is tested by crafting a query advertising a sub-response EDNS size.
 - DNS-over-TCP is length-prefixed (2-byte big-endian length) and never truncates.
 
+## `doctor`: two-path liveness + cross-OS probes without `#[cfg]`
+
+`doctor` splits DECISION logic (pure `evaluate_*` + `Report::build`, ~100% unit-tested) from the
+LIVE probes (bind loopback, DNS query, OS getaddrinfo, gateway probe, browser-policy read, `:80`
+holder). Overall outcome = `loopback_up && (path_a || path_b)` — a `.dig` URL loads iff the IP is
+up and at least one path is live; individual link fails/warns explain WHY. `path_a` = OS routing
+returns the IP (needs the installer's split-DNS, so it WARNs on a dev box); `path_b` = the gateway
+answered `/.dig/resolve-probe`.
+
+The OS-specific probes (browser DoH policy, `:80` holder) branch on `std::env::consts::OS` at
+RUNTIME and shell out via `std::process::Command` / `std::fs` — deliberately NO `#[cfg]` blocks,
+so the code compiles identically on every release target (the `#[cfg(windows)]`/`#[cfg(macos)]`
+paths would only be compiled by the release matrix, not ubuntu CI clippy — a runtime branch is
+checked everywhere and a missing tool just degrades to "unknown"). Gotcha: a `:80` port-holder
+substring match hits `:8000`/`:8080` — require the char after `:{port}` to be a non-digit.
+
 ## `serve` runs BOTH paths; the DNS bind is non-fatal
 
 `server::run_service` brings up the gateway AND the DNS responder. The two resolution paths are

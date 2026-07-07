@@ -70,6 +70,13 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Diagnose each link of both resolution paths (DNS + gateway) with fix hints. Exits
+    /// non-zero when a `.dig` URL cannot load.
+    Doctor {
+        /// Emit the report as JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `dig-dns label …` operations.
@@ -153,9 +160,10 @@ where
                 ))
             }
         }
-        // `serve`/`fetch` are async and run directly in `run()`; `execute` is the pure path.
-        Command::Serve { .. } | Command::Fetch { .. } => {
-            Err("serve/fetch run via the binary entrypoint, not execute()".to_string())
+        // `serve`/`fetch`/`doctor` are async and run directly in `run()`; `execute` is the pure
+        // path.
+        Command::Serve { .. } | Command::Fetch { .. } | Command::Doctor { .. } => {
+            Err("serve/fetch/doctor run via the binary entrypoint, not execute()".to_string())
         }
     }
 }
@@ -227,6 +235,27 @@ pub fn run() -> std::process::ExitCode {
             match rt.block_on(crate::server::fetch_resource(cfg, target, path)) {
                 Ok(resp) => print_fetch(&resp, *json),
                 Err(e) => fail(&e.to_string()),
+            }
+        }
+        Command::Doctor { json } => {
+            let cfg = match load_config(None) {
+                Ok(c) => c,
+                Err(e) => return fail(&e),
+            };
+            let rt = match runtime() {
+                Ok(rt) => rt,
+                Err(e) => return fail(&e.to_string()),
+            };
+            let report = rt.block_on(crate::doctor::run(&cfg));
+            if *json {
+                println!("{}", report.to_json());
+            } else {
+                print!("{}", report.to_text());
+            }
+            if report.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
             }
         }
         _ => match execute(&cli, |k| std::env::var(k).ok()) {
