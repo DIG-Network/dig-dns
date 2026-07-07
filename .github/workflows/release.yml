@@ -1,0 +1,132 @@
+name: Release dig-dns
+
+# On a version tag (v*), build the self-contained `dig-dns` service binary for every
+# supported OS/arch and attach them to a GitHub Release. Tag-driven per-OS matrix,
+# mirroring dig-node's release workflow; the artifact is the plain installable binary
+# (the dig-installer resolves + installs it as an OS service — Component B, a separate
+# unit). A push to main also builds (no publish) so a broken build is caught before a tag.
+#
+# The changelog-carrying tag itself is created by changelog-tag.yml on merge to main
+# (git-cliff regenerates CHANGELOG.md, commits it, then tags — CLAUDE.md §3.6). This
+# workflow only fires ON that pushed tag to produce + publish binaries.
+#
+# dig-dns is a lean, pure-Rust binary (rustls TLS, no OpenSSL / wasmtime), so every target
+# builds without a cross C-toolchain. One canonical asset stem: `dig-dns-<ver>-<os-arch>`.
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+
+jobs:
+  # Gate: a tag that doesn't pass fmt + clippy + tests never produces release binaries.
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust (stable + components)
+        run: |
+          rustup toolchain install stable --component rustfmt --component clippy
+          rustup default stable
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    name: build (${{ matrix.out_name }})
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: dig-dns.exe
+            out_name: windows-x64.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: dig-dns
+            out_name: linux-x64
+          - os: macos-14 # Apple silicon (arm64)
+            target: aarch64-apple-darwin
+            bin: dig-dns
+            out_name: macos-arm64
+          - os: macos-14 # Apple silicon — cross-compiles the Intel binary
+            target: x86_64-apple-darwin
+            bin: dig-dns
+            out_name: macos-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust + target
+        shell: bash
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-dns
+      - name: Stage artifact
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = "tag" ] || VER="g$(git rev-parse --short HEAD)"
+          mkdir -p dist
+          SRC="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          test -f "$SRC" || { echo "binary not produced: $SRC"; exit 1; }
+          cp "$SRC" "dist/dig-dns-${VER}-${{ matrix.out_name }}"
+          ls -la dist
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dig-dns-${{ matrix.out_name }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -la release
+      - name: Create / update the release and attach binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

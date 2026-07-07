@@ -1,0 +1,45 @@
+# dig-dns — the local `*.dig` resolver: a DNS responder + HTTP gateway that turns
+# `http://<base32-storeId>.dig/<path>` into DIG store content fetched from a dig-node.
+#
+# A single package with BOTH a library (`dig_dns`, where all the logic lives so it is
+# unit-testable) and the service binary (`dig-dns`, a thin CLI shell over the library).
+#
+# The RELEASE version is `[package].version` at the root manifest — the version-increment
+# gate (.github/workflows/ensure-version-increment.yml) and the tag-on-merge release
+# (.github/workflows/changelog-tag.yml) both read it from here, so it MUST live at the
+# root and increase on every PR (CLAUDE.md §2.4 / §3.6).
+[package]
+name = "dig-dns"
+version = "0.1.0"
+edition = "2021"
+description = "Local *.dig name resolution: a DNS responder + HTTP gateway resolving <storeId>.dig to DIG store content via a dig-node."
+license = "GPL-2.0-only"
+repository = "https://github.com/DIG-Network/dig-dns"
+readme = "README.md"
+
+[lib]
+name = "dig_dns"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dig-dns"
+path = "src/main.rs"
+
+[dependencies]
+# base32 (RFC 4648) for the DNS-label <-> 32-byte storeId codec, and hex for the
+# storeId's canonical lowercase-hex form used in the dig-node RPC.
+data-encoding = "2"
+hex = "0.4"
+# CLI + machine-readable (--json) output (CLAUDE.md §6.2 agent-friendly).
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+
+# Release hardening, matching digstore/dig-node: keep integer-overflow checks ON in
+# release. The gateway does offset/length arithmetic over untrusted network input, so a
+# silent wrap in release would turn a length bug into a memory/logic hazard.
+[profile.release]
+overflow-checks = true
