@@ -25,7 +25,7 @@ pub fn generate(loopback_ip: Ipv4Addr, port: u16, tld: &str) -> String {
     let tld = tld.trim().trim_start_matches('.').to_ascii_lowercase();
     // `.dig` suffix (covers `x.dig` and `a.b.dig`) OR the bare apex `dig`.
     format!(
-        "// dig-dns PAC — routes *.{tld} to the local gateway, everything else DIRECT.\n\
+        "// dig-dns PAC - routes *.{tld} to the local gateway, everything else DIRECT.\n\
          // Generated with the actually-bound gateway port ({port}).\n\
          function FindProxyForURL(url, host) {{\n\
          \x20 host = host.toLowerCase();\n\
