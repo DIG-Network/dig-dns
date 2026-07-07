@@ -69,11 +69,14 @@ Control endpoints (also directly on the IP): `GET /.dig/health` (JSON), `GET /.d
 loopback-only, never an open proxy (a non-`.dig` proxy target → `403`), never tunnels CONNECT,
 and never intercepts TLS.
 
-**Acceptance:** `scripts/gateway-acceptance.sh` proves the gateway with curl (control endpoints
-+ open-proxy `403` + bad-host `404` need no node; set `STORE_LABEL`/`ROOT_LABEL` + `NODE` for the
-content + pinned-vs-latest checks). The Rust integration test `tests/gateway_stub_node.rs` proves
-all of it deterministically (both request forms, SPA, ranges, and the pinned-vs-latest proof)
-against a stub node.
+**Acceptance:** per-OS runtime acceptance scripts start `dig-dns serve` on high ports and prove
+`doctor` + the control endpoints + open-proxy `403` + bad-host `404` + the DNS responder (no node
+needed); set `STORE_LABEL`/`ROOT_LABEL` + `NODE` for the content + pinned-vs-latest checks:
+`scripts/acceptance-unix.sh` (macOS/Linux) and `scripts/acceptance-windows.ps1` (Windows). Also
+`dig-dns pac [--port N]` prints the PAC file (embedding the actual bound port; probes a running
+gateway when `--port` is omitted). The Rust integration tests prove the runtime deterministically
+(`tests/gateway_stub_node.rs` — both request forms, SPA, ranges, pinned-vs-latest;
+`tests/dns_responder.rs` — UDP+TCP; `tests/doctor_live.rs` — doctor against a live service).
 
 The PAC CLI + README + per-OS acceptance scripts (Phase 5) land next.
 

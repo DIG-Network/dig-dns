@@ -77,6 +77,16 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Generate the PAC file (Path B) routing `*.<tld>` through the gateway. Uses the actual
+    /// bound port: `--port` if given, else the running gateway's port, else the configured port.
+    Pac {
+        /// Force a specific gateway port instead of probing the running gateway.
+        #[arg(long, value_name = "PORT")]
+        port: Option<u16>,
+        /// Emit JSON metadata (loopback_ip, port, tld, pac) instead of the raw PAC text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `dig-dns label …` operations.
@@ -160,10 +170,13 @@ where
                 ))
             }
         }
-        // `serve`/`fetch`/`doctor` are async and run directly in `run()`; `execute` is the pure
-        // path.
-        Command::Serve { .. } | Command::Fetch { .. } | Command::Doctor { .. } => {
-            Err("serve/fetch/doctor run via the binary entrypoint, not execute()".to_string())
+        // `serve`/`fetch`/`doctor`/`pac` are async and run directly in `run()`; `execute` is
+        // the pure path.
+        Command::Serve { .. }
+        | Command::Fetch { .. }
+        | Command::Doctor { .. }
+        | Command::Pac { .. } => {
+            Err("serve/fetch/doctor/pac run via the binary entrypoint, not execute()".to_string())
         }
     }
 }
@@ -257,6 +270,42 @@ pub fn run() -> std::process::ExitCode {
             } else {
                 ExitCode::FAILURE
             }
+        }
+        Command::Pac { port, json } => {
+            let cfg = match load_config(None) {
+                Ok(c) => c,
+                Err(e) => return fail(&e),
+            };
+            // The bound port: an explicit --port, else the running gateway's port, else the
+            // configured primary (noted as a best-effort default when nothing is running).
+            let bound_port = match port {
+                Some(p) => *p,
+                None => {
+                    let rt = match runtime() {
+                        Ok(rt) => rt,
+                        Err(e) => return fail(&e.to_string()),
+                    };
+                    rt.block_on(crate::server::probe_gateway_port(
+                        cfg.loopback_ip,
+                        cfg.http_port,
+                        cfg.http_fallback_port,
+                    ))
+                    .unwrap_or(cfg.http_port)
+                }
+            };
+            let pac = crate::pac::generate(cfg.loopback_ip, bound_port, &cfg.tld);
+            if *json {
+                let meta = json!({
+                    "loopback_ip": cfg.loopback_ip.to_string(),
+                    "port": bound_port,
+                    "tld": cfg.tld,
+                    "pac": pac,
+                });
+                println!("{meta}");
+            } else {
+                print!("{pac}");
+            }
+            ExitCode::SUCCESS
         }
         _ => match execute(&cli, |k| std::env::var(k).ok()) {
             Ok(out) => {
