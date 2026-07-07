@@ -295,6 +295,72 @@ fn write_opt(out: &mut Vec<u8>) {
     out.extend_from_slice(&0u16.to_be_bytes()); // rdlength 0
 }
 
+// --- Client-side helpers (used by `doctor`'s direct-DNS probe) ------------------------------
+
+/// Build a standard DNS query (id `0x0000`, RD set, one question) for `name` + `A`. Encodes each
+/// dot-separated label; no EDNS. Used to probe the responder directly.
+pub fn build_a_query(name: &str) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.extend_from_slice(&[0x00, 0x00]); // id
+    m.extend_from_slice(&0x0100u16.to_be_bytes()); // flags: RD
+    m.extend_from_slice(&1u16.to_be_bytes()); // qdcount
+    m.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // an/ns/ar = 0
+    for label in name.split('.').filter(|l| !l.is_empty()) {
+        let len = label.len().min(63) as u8;
+        m.push(len);
+        m.extend_from_slice(&label.as_bytes()[..len as usize]);
+    }
+    m.push(0); // root
+    m.extend_from_slice(&TYPE_A.to_be_bytes());
+    m.extend_from_slice(&1u16.to_be_bytes()); // qclass IN
+    m
+}
+
+/// Advance past a DNS name at `pos`, returning the position after it. A compression pointer
+/// (top two bits set) is two bytes; otherwise it is length-prefixed labels ending in a zero.
+fn skip_name(msg: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let len = *msg.get(pos)? as usize;
+        if len == 0 {
+            return Some(pos + 1);
+        }
+        if len & 0xC0 == 0xC0 {
+            return Some(pos + 2); // compression pointer
+        }
+        pos += 1 + len;
+    }
+}
+
+/// Parse the FIRST `A` record's IPv4 address from a DNS RESPONSE, walking past the questions and
+/// answer names (compression-aware). Returns `None` when there is no `A` answer.
+pub fn parse_first_a_ipv4(response: &[u8]) -> Option<Ipv4Addr> {
+    if response.len() < HEADER_LEN {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([response[4], response[5]]);
+    let ancount = u16::from_be_bytes([response[6], response[7]]);
+    let mut pos = HEADER_LEN;
+    // Skip the questions (name + qtype(2) + qclass(2)).
+    for _ in 0..qdcount {
+        pos = skip_name(response, pos)?;
+        pos += 4;
+    }
+    // Walk the answers.
+    for _ in 0..ancount {
+        pos = skip_name(response, pos)?;
+        let rtype = u16::from_be_bytes([*response.get(pos)?, *response.get(pos + 1)?]);
+        let rdlength =
+            u16::from_be_bytes([*response.get(pos + 8)?, *response.get(pos + 9)?]) as usize;
+        let rdata_start = pos + 10;
+        if rtype == TYPE_A && rdlength == 4 {
+            let b = response.get(rdata_start..rdata_start + 4)?;
+            return Some(Ipv4Addr::new(b[0], b[1], b[2], b[3]));
+        }
+        pos = rdata_start + rdlength;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,5 +590,39 @@ mod tests {
         // TTL is the 4 bytes just before rdlength(2)+rdata(4) at the end.
         let ttl_bytes = &resp[resp.len() - 10..resp.len() - 6];
         assert_eq!(u32::from_be_bytes(ttl_bytes.try_into().unwrap()), 5);
+    }
+
+    #[test]
+    fn build_query_round_trips_through_respond_and_parse() {
+        // A client query built here, answered by respond(), parses back to the served IP.
+        let q = build_a_query("mystore.dig");
+        let resp = respond(&q, IP, "dig", 2, Transport::Udp).unwrap();
+        assert_eq!(parse_first_a_ipv4(&resp), Some(IP));
+    }
+
+    #[test]
+    fn parse_first_a_is_none_for_nodata_and_refused() {
+        // AAAA under .dig → NODATA (no A answer).
+        let resp = respond(&query("x.dig", 28, None), IP, "dig", 2, Transport::Udp).unwrap();
+        assert_eq!(parse_first_a_ipv4(&resp), None);
+        // non-.dig → REFUSED (no answer).
+        let resp = respond(&query("x.com", TYPE_A, None), IP, "dig", 2, Transport::Udp).unwrap();
+        assert_eq!(parse_first_a_ipv4(&resp), None);
+    }
+
+    #[test]
+    fn parse_first_a_handles_edns_and_short_input() {
+        // With an EDNS OPT echoed in the additional section, the A answer is still found.
+        let resp = respond(
+            &query("x.dig", TYPE_A, Some(4096)),
+            IP,
+            "dig",
+            2,
+            Transport::Udp,
+        )
+        .unwrap();
+        assert_eq!(parse_first_a_ipv4(&resp), Some(IP));
+        // Too short to hold a header → None (never panics).
+        assert_eq!(parse_first_a_ipv4(&[0u8; 4]), None);
     }
 }
