@@ -1,0 +1,87 @@
+name: CI
+
+# The release-gate set (CLAUDE.md §2.4a) that every PR to main must pass GREEN before
+# merge. Job names here are the required status checks in branch protection: Rustfmt,
+# Clippy, Test + coverage, Build. (Commit-message + version-increment gates live in their
+# own workflows.)
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test + coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      # Run the whole test suite AND gate line coverage at >=80% (CLAUDE.md §2.3) in one
+      # instrumented build. A build below the floor FAILS.
+      - name: cargo llvm-cov (test + coverage, gated >=80%)
+        run: cargo llvm-cov --all-features --fail-under-lines 80 --summary-only | tee coverage-summary.txt
+      - name: Coverage summary to job summary
+        if: always()
+        run: |
+          {
+            echo '### dig-dns coverage'
+            echo '```'
+            cat coverage-summary.txt 2>/dev/null || echo 'no coverage output'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-targets --locked

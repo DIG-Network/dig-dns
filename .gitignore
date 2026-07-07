@@ -1,0 +1,3 @@
+# Rust build output (regenerable; per CLAUDE.md §1.6 the target/ is deleted when a phase
+# is committed + green).
+/target
