@@ -8,7 +8,7 @@
 
 use std::convert::Infallible;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -20,11 +20,13 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, UdpSocket};
 
 use hyper::Uri;
 
 use crate::config::Config;
+use crate::dns::{self, Transport};
 use crate::gateway::{handle, Ctx, GatewayResponse};
 use crate::transport::{NodeClient, ReqwestNodeClient};
 
@@ -151,28 +153,121 @@ pub async fn serve_on<N>(
     }
 }
 
-/// Resolve the node (§5.3 ladder), bind the gateway (with `:8053` fallback), log loudly, and
-/// serve until Ctrl-C. This is the `dig-dns serve` entry point.
-pub async fn run_gateway(config: Config) -> Result<(), ServerError> {
+/// Bind the DNS responder on `<ip>:<port>` for BOTH UDP and TCP (SPEC §3). Loopback-only —
+/// the caller passes the validated loopback IP.
+pub async fn bind_dns(ip: Ipv4Addr, port: u16) -> std::io::Result<(UdpSocket, TcpListener)> {
+    let addr = SocketAddr::from((ip, port));
+    let udp = UdpSocket::bind(addr).await?;
+    let tcp = TcpListener::bind(addr).await?;
+    Ok((udp, tcp))
+}
+
+/// Serve the DNS responder on an already-bound UDP socket + TCP listener until `shutdown`
+/// resolves. UDP answers are built + sent inline (they are tiny + constant-time); each TCP
+/// connection is handled on its own task. A per-message error is logged and never stops the
+/// loop.
+pub async fn serve_dns(
+    udp: UdpSocket,
+    tcp: TcpListener,
+    ip: Ipv4Addr,
+    tld: String,
+    ttl: u32,
+    shutdown: impl Future<Output = ()>,
+) {
+    let udp = Arc::new(udp);
+    let mut buf = vec![0u8; 4096]; // EDNS payloads up to 4 KiB
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                tracing::info!("DNS responder shutting down");
+                break;
+            }
+            recv = udp.recv_from(&mut buf) => {
+                let (n, peer) = match recv {
+                    Ok(v) => v,
+                    Err(e) => { tracing::warn!(error = %e, "DNS UDP recv failed"); continue; }
+                };
+                if let Some(resp) = dns::respond(&buf[..n], ip, &tld, ttl, Transport::Udp) {
+                    if let Err(e) = udp.send_to(&resp, peer).await {
+                        tracing::debug!(error = %e, "DNS UDP send failed");
+                    }
+                }
+            }
+            accepted = tcp.accept() => {
+                let (stream, _peer) = match accepted {
+                    Ok(v) => v,
+                    Err(e) => { tracing::warn!(error = %e, "DNS TCP accept failed"); continue; }
+                };
+                let tld = tld.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_dns_tcp(stream, ip, tld, ttl).await {
+                        tracing::debug!(error = %e, "DNS TCP query failed");
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Handle one length-prefixed DNS-over-TCP query (RFC 1035 §4.2.2): read the 2-byte length,
+/// the message, build the (untruncated) response, and write it back length-prefixed.
+async fn handle_dns_tcp(
+    mut stream: tokio::net::TcpStream,
+    ip: Ipv4Addr,
+    tld: String,
+    ttl: u32,
+) -> std::io::Result<()> {
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf).await?;
+    let len = u16::from_be_bytes(len_buf) as usize;
+    let mut msg = vec![0u8; len];
+    stream.read_exact(&mut msg).await?;
+    if let Some(resp) = dns::respond(&msg, ip, &tld, ttl, Transport::Tcp) {
+        let rlen = (resp.len() as u16).to_be_bytes();
+        stream.write_all(&rlen).await?;
+        stream.write_all(&resp).await?;
+        stream.flush().await?;
+    }
+    Ok(())
+}
+
+/// Resolve the node (§5.3 ladder), bind the HTTP gateway (with the `:8053` fallback) AND the
+/// DNS responder (`:53`), log loudly, and serve both until Ctrl-C. This is the `dig-dns serve`
+/// entry point. The two resolution paths are independent: a DNS `:53` bind failure (e.g.
+/// unprivileged, or `:53` held) is NON-fatal — the gateway + PAC (Path B) still serve `.dig`.
+pub async fn run_service(config: Config) -> Result<(), ServerError> {
     crate::transport::init_crypto();
     let client = Arc::new(ReqwestNodeClient::resolve(&config).await?);
     let primary = SocketAddr::from((config.loopback_ip, config.http_port));
     let fallback = SocketAddr::from((config.loopback_ip, config.http_fallback_port));
     let (listener, bound_port, used_fallback) = bind_listener(primary, fallback).await?;
 
+    // Path A (DNS) is best-effort; Path B (gateway + PAC) is the floor.
+    let dns = bind_dns(config.loopback_ip, config.dns_port).await;
+    let dns_active = dns.is_ok();
+    if let Err(e) = &dns {
+        tracing::warn!(
+            error = %e,
+            "DNS responder could not bind :{} — Path A (OS split-DNS) is unavailable; the \
+             gateway + PAC (Path B) still serve .dig",
+            config.dns_port
+        );
+    }
+
     let ctx = Ctx {
-        config,
+        config: config.clone(),
         bound_port,
-        dns_active: false,
+        dns_active,
         started: Instant::now(),
     };
-
     tracing::info!(
-        loopback_ip = %ctx.config.loopback_ip,
+        loopback_ip = %config.loopback_ip,
         bound_port,
         used_fallback,
+        dns_active,
         node = client.base_url(),
-        "dig-dns HTTP gateway listening"
+        "dig-dns service listening"
     );
     if used_fallback {
         tracing::warn!(
@@ -180,10 +275,22 @@ pub async fn run_gateway(config: Config) -> Result<(), ServerError> {
             "primary :{} was unavailable — bound the fallback :{}. Browsers relying on OS DNS \
              (Path A) will hit :{} directly; if that is not the browser default port, use the \
              PAC file (/.dig/proxy.pac), which advertises the bound port.",
-            ctx.config.http_port,
+            config.http_port,
             bound_port,
             bound_port
         );
+    }
+
+    if let Ok((udp, tcp)) = dns {
+        let ip = config.loopback_ip;
+        let tld = config.tld.clone();
+        let ttl = config.dns_ttl_secs;
+        tokio::spawn(async move {
+            serve_dns(udp, tcp, ip, tld, ttl, async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await;
+        });
     }
 
     serve_on(listener, client, ctx, async {
