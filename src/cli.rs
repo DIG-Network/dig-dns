@@ -6,8 +6,12 @@
 //! the process environment or exit codes; [`run`] is the thin `main` glue that parses
 //! argv, prints, and maps to an exit code.
 //!
-//! Phase 1 ships `label` (the base32 codec as a CLI tool) and `config` (introspect the
-//! resolved configuration). `serve`, `doctor`, and `pac` are added in their phases.
+//! `label` (the base32 codec) + `config` (introspect the resolved configuration) are pure and
+//! run through [`execute`]. `serve` (run the HTTP gateway) and `fetch` (one-shot resolve a
+//! `.dig` resource) are async and dispatched directly in [`run`] on a tokio runtime. `doctor`
+//! and `pac` are added in their phases.
+
+use std::io::Write;
 
 use clap::{Parser, Subcommand};
 use serde_json::json;
@@ -39,6 +43,29 @@ pub enum Command {
     /// Print the resolved configuration (defaults layered with environment overrides).
     Config {
         /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the HTTP gateway on the loopback IP (binds `:80`, deterministic fallback `:8053`).
+    /// Serves `.dig` content resolved from a dig-node; runs until Ctrl-C.
+    Serve {
+        /// Explicit dig-node endpoint (highest precedence; else the §5.3 ladder
+        /// dig.local → localhost:9778 → rpc.dig.net).
+        #[arg(long, value_name = "URL")]
+        node: Option<String>,
+    },
+    /// Resolve a single `.dig` resource through the gateway pipeline and print it. Accepts a
+    /// bare host (`<label>.dig`), a `host/path`, or a full `http://<label>.dig/path` URL.
+    Fetch {
+        /// The `.dig` host or full URL to resolve.
+        target: String,
+        /// The resource path (used only when `target` is a bare host). Defaults to `/`.
+        #[arg(default_value = "/")]
+        path: String,
+        /// Explicit dig-node endpoint (highest precedence; else the §5.3 ladder).
+        #[arg(long, value_name = "URL")]
+        node: Option<String>,
+        /// Emit JSON metadata (status, content-type, length, node) instead of the raw body.
         #[arg(long)]
         json: bool,
     },
@@ -125,21 +152,125 @@ where
                 ))
             }
         }
+        // `serve`/`fetch` are async and run directly in `run()`; `execute` is the pure path.
+        Command::Serve { .. } | Command::Fetch { .. } => {
+            Err("serve/fetch run via the binary entrypoint, not execute()".to_string())
+        }
     }
+}
+
+/// Load the config from the environment, layering an explicit `--node` flag over it (the
+/// flag has the highest §5.3 precedence). A blank flag is ignored (⇒ use the ladder).
+fn load_config(node_flag: Option<&str>) -> Result<config::Config, String> {
+    let mut cfg = config::from_env(|k| std::env::var(k).ok()).map_err(|e| e.to_string())?;
+    if let Some(url) = node_flag {
+        if !url.trim().is_empty() {
+            cfg.node_url = Some(url.trim().to_string());
+        }
+    }
+    Ok(cfg)
+}
+
+/// A multi-threaded tokio runtime for the async subcommands.
+fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+}
+
+/// Initialise loud, env-filterable structured logging for the service (`RUST_LOG` respected,
+/// default `info`). Best-effort: a second init (e.g. in tests) is ignored.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .try_init();
 }
 
 /// Parse argv, run the command, print the result, and return the process exit code.
 pub fn run() -> std::process::ExitCode {
+    use std::process::ExitCode;
     let cli = Cli::parse();
-    match execute(&cli, |k| std::env::var(k).ok()) {
-        Ok(out) => {
-            println!("{out}");
-            std::process::ExitCode::SUCCESS
+    match &cli.command {
+        Command::Serve { node } => {
+            init_tracing();
+            let cfg = match load_config(node.as_deref()) {
+                Ok(c) => c,
+                Err(e) => return fail(&e),
+            };
+            let rt = match runtime() {
+                Ok(rt) => rt,
+                Err(e) => return fail(&e.to_string()),
+            };
+            match rt.block_on(crate::server::run_gateway(cfg)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e.to_string()),
+            }
         }
-        Err(msg) => {
-            eprintln!("error: {msg}");
-            std::process::ExitCode::FAILURE
+        Command::Fetch {
+            target,
+            path,
+            node,
+            json,
+        } => {
+            let cfg = match load_config(node.as_deref()) {
+                Ok(c) => c,
+                Err(e) => return fail(&e),
+            };
+            let rt = match runtime() {
+                Ok(rt) => rt,
+                Err(e) => return fail(&e.to_string()),
+            };
+            match rt.block_on(crate::server::fetch_resource(cfg, target, path)) {
+                Ok(resp) => print_fetch(&resp, *json),
+                Err(e) => fail(&e.to_string()),
+            }
         }
+        _ => match execute(&cli, |k| std::env::var(k).ok()) {
+            Ok(out) => {
+                println!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(msg) => fail(&msg),
+        },
+    }
+}
+
+/// Print an error to stderr and return the failure exit code.
+fn fail(msg: &str) -> std::process::ExitCode {
+    eprintln!("error: {msg}");
+    std::process::ExitCode::FAILURE
+}
+
+/// Print a fetched resource: `--json` metadata to stdout, or the raw body to stdout (a
+/// non-2xx status is reported on stderr + a non-zero exit).
+fn print_fetch(resp: &crate::gateway::GatewayResponse, json: bool) -> std::process::ExitCode {
+    let content_type = resp
+        .headers
+        .iter()
+        .find(|(k, _)| k == "content-type")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    if json {
+        let meta = json!({
+            "status": resp.status,
+            "content_type": content_type,
+            "length": resp.body.len(),
+        });
+        println!("{meta}");
+    } else {
+        let _ = std::io::stdout().write_all(&resp.body);
+        let _ = std::io::stdout().flush();
+        if resp.status >= 400 {
+            eprintln!("\nerror: status {}", resp.status);
+        }
+    }
+    if resp.status < 400 {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
     }
 }
 
@@ -232,6 +363,15 @@ mod tests {
         assert!(out.contains("loopback_ip"));
         assert!(out.contains("127.0.0.5"));
         assert!(out.contains("dig"));
+    }
+
+    #[test]
+    fn execute_rejects_async_commands() {
+        // `serve`/`fetch` are dispatched by run(), not execute(); execute reports that.
+        let err = execute(&cli(&["serve"]), no_env).unwrap_err();
+        assert!(err.contains("serve/fetch"), "unexpected: {err}");
+        let err = execute(&cli(&["fetch", "abc.dig"]), no_env).unwrap_err();
+        assert!(err.contains("serve/fetch"), "unexpected: {err}");
     }
 
     #[test]

@@ -20,17 +20,43 @@ cargo fmt --all -- --check
 cargo llvm-cov --fail-under-lines 80 --summary-only
 ```
 
-**Run (Phase 1 CLI):**
+**Run — CLI:**
 
 ```sh
 dig-dns label encode <64-hex-store-id>     # -> <base32>.dig
 dig-dns label decode <label|host>          # -> <64-hex>
 dig-dns config [--json]                     # resolved config
+dig-dns serve [--node <URL>]               # run the HTTP gateway (Ctrl-C to stop)
+dig-dns fetch <host|url> [path] [--json]    # one-shot: resolve a .dig resource + print it
 ```
 
-`serve` (the DNS responder + HTTP gateway) and `doctor` land in Phases 2–4. When present,
-`serve` binds `127.0.0.5:53` (DNS) + `127.0.0.5:80` (HTTP, fallback `:8053`) — binding `:53`
-and `:80` requires elevation / `CAP_NET_BIND_SERVICE`, which the installer arranges.
+**HTTP gateway (`serve`).** Binds `127.0.0.5:80` (deterministic fallback `127.0.0.5:8053` when
+`:80` is held — logged loudly + reported by `/.dig/health`). Binding `:80` on the dedicated
+loopback IP requires elevation / `CAP_NET_BIND_SERVICE` and that `127.0.0.5` be up (the
+installer, Component B, arranges both). For an unprivileged local run, override the bind:
+
+```sh
+DIG_DNS_IP=127.0.0.1 DIG_DNS_HTTP_PORT=8080 dig-dns serve --node http://localhost:9778
+# then, in another shell:
+curl -s http://127.0.0.1:8080/.dig/health | jq .          # service state
+curl -s http://127.0.0.1:8080/.dig/proxy.pac              # PAC (advertises the bound port)
+curl -H 'Host: <label>.dig' http://127.0.0.1:8080/        # origin-form (Path A)
+curl -x http://127.0.0.1:8080 http://<label>.dig/         # absolute-form proxy (Path B)
+dig-dns fetch <label>.dig / --node http://localhost:9778  # curl-free fetch
+```
+
+Control endpoints (also directly on the IP): `GET /.dig/health` (JSON), `GET /.dig/proxy.pac`
+(the PAC with the actually-bound port), `GET /.dig/resolve-probe` (`204`). The gateway is
+loopback-only, never an open proxy (a non-`.dig` proxy target → `403`), never tunnels CONNECT,
+and never intercepts TLS.
+
+**Acceptance:** `scripts/gateway-acceptance.sh` proves the gateway with curl (control endpoints
++ open-proxy `403` + bad-host `404` need no node; set `STORE_LABEL`/`ROOT_LABEL` + `NODE` for the
+content + pinned-vs-latest checks). The Rust integration test `tests/gateway_stub_node.rs` proves
+all of it deterministically (both request forms, SPA, ranges, and the pinned-vs-latest proof)
+against a stub node.
+
+The DNS responder (`serve` will also bind `127.0.0.5:53`) and `doctor` land in Phases 3–4.
 
 **Config** is defaults + environment overrides (see `SPEC.md §7`): `DIG_DNS_IP`,
 `DIG_DNS_DNS_PORT`, `DIG_DNS_HTTP_PORT`, `DIG_DNS_HTTP_FALLBACK_PORT`, `DIG_DNS_TLD`,

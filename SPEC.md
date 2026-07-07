@@ -394,9 +394,13 @@ At least one of {Path A end-to-end, Path B (PAC + gateway)} passing means a `.di
 ## 10. Machine-friendliness (§6.2)
 
 - `doctor` and `/.dig/health` provide `--json` / JSON output with stable field names.
-- Errors are catalogued with stable meanings; the gateway uses standard HTTP status codes
-  (403 non-.dig proxy / CONNECT, 404 invalid label or missing extensioned resource, 200 SPA
-  fallback, 206 range, 502 node unreachable).
+- Errors are catalogued with stable meanings; the gateway uses standard HTTP status codes:
+  **405** CONNECT or any non-`GET`/`HEAD` method; **403** an absolute-form proxy authority not
+  under `.<tld>`; **404** an invalid `<label>.<tld>` host, a missing extensioned resource, or a
+  store with no anchored root; **400** a traversing request path; **200** a served resource or
+  an SPA `/index.html` fallback; **206** a satisfied byte range; **416** an unsatisfiable range;
+  **502** the node is unreachable OR it served content that failed merkle verification against
+  the trusted root (fail-closed — never serve unverified bytes).
 - Modules are small and single-purpose with doc-comments; the library (`dig_dns`) is fully
   unit-tested and the binary is a thin shell over it.
 
