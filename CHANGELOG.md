@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.4.0] - 2026-07-07
+
+### Features
+- DNS responder — UDP+TCP *.dig -> A 127.0.0.5, EDNS0/TC, wired into serve (#4)
+
 ## [0.3.0] - 2026-07-07
 
 ### Features
