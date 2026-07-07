@@ -40,6 +40,11 @@ pub enum NodeError {
     /// The node response did not match the expected shape.
     #[error("malformed node response: {0}")]
     Malformed(String),
+    /// The node could not be reached (connection refused, timeout, DNS, TLS, non-2xx HTTP
+    /// status). Distinct from a well-formed JSON-RPC error — this maps to an HTTP `502` at the
+    /// gateway (the store may well exist; the node is just unreachable), never to a `404`.
+    #[error("node transport error: {0}")]
+    Transport(String),
 }
 
 impl NodeError {
@@ -57,7 +62,7 @@ impl NodeError {
                         Some("RESOURCE_UNAVAILABLE") | Some("ROOT_NOT_ANCHORED")
                     )
             }
-            NodeError::Malformed(_) => false,
+            NodeError::Malformed(_) | NodeError::Transport(_) => false,
         }
     }
 }

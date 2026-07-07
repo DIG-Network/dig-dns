@@ -10,7 +10,7 @@
 # root and increase on every PR (CLAUDE.md §2.4 / §3.6).
 [package]
 name = "dig-dns"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Local *.dig name resolution: a DNS responder + HTTP gateway resolving <storeId>.dig to DIG store content via a dig-node."
 license = "GPL-2.0-only"
@@ -43,7 +43,60 @@ base64 = "0.22"
 # wasm-clean (no BLS/blst): sha2 + hkdf + aes-gcm-siv only.
 digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7" }
 
+# --- Phase 2b: the async HTTP gateway server + node transport ---
+# Async runtime for the listener + the node client. Loopback-only, so no need for the
+# broader net stack — just TCP, timers (ladder probe timeouts), signal (graceful shutdown).
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "macros",
+    "time",
+    "signal",
+    "io-util",
+] }
+# The HTTP/1.1 server for the gateway. Raw hyper (not axum) because the gateway must see
+# absolute-form proxy URIs + the CONNECT method to enforce the "never an open proxy" rule
+# (SPEC §4.1/§4.2) — routing frameworks assume origin-form requests.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+# The node transport is an async trait object (`Arc<dyn NodeClient>`); async-trait boxes the
+# futures as Send so per-connection tasks spawn cleanly on the multi-thread runtime.
+async-trait = "0.1"
+# The dig-node JSON-RPC client. rustls + **ring** with bundled webpki roots, NO provider
+# auto-selected (we install ring explicitly) — this keeps aws-lc-rs (needs a C toolchain +
+# cross-compiles poorly to x86_64-apple-darwin) and OpenSSL out of the tree, so every
+# release target builds without a cross C-toolchain (release.yml intent).
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls-webpki-roots-no-provider",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+# Structured, loud logging (which port bound, the resolved node tier) for the OS service.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
 [dev-dependencies]
+# The integration test spins a real stub dig-node (hyper) + drives the real gateway over
+# loopback with reqwest, and builds .dig fixtures with the same read-crypto primitives.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls-webpki-roots-no-provider",
+] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+base64 = "0.22"
+serde_json = "1"
+digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7" }
 
 # Release hardening, matching digstore/dig-node: keep integer-overflow checks ON in
 # release. The gateway does offset/length arithmetic over untrusted network input, so a
