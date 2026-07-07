@@ -44,7 +44,26 @@ A DIG store id is **32 bytes**, canonically **64 lowercase hex** characters
 
 - **lowercase RFC 4648 base32, no padding** — exactly **52 characters** (`ceil(256/5) = 52`).
 
-The browsable host is `<label>.<tld>`, e.g. `<52-char-base32>.dig`.
+### 2.1 Host forms — latest vs pinned root (capsule)
+
+A `.dig` host carries ONE or TWO store labels, selecting which root to serve (aligns with the
+#128 URN grammar: a capsule is `storeId:rootHash`):
+
+- **`<storeId>.dig`** (one label before the TLD) → serve the store's LATEST chain-anchored
+  root.
+- **`<rootId>.<storeId>.dig`** (two labels; the LEFTMOST is the pinned root, the next is the
+  store) → serve that EXACT root — a capsule. A literal `storeId:rootHash` colon is only the
+  logical/URN form: `:` is not a valid DNS label character and a browser parses `host:NNN` as
+  a port, so the pinned root is carried as a left-most subdomain label instead.
+
+Both labels use the SAME 52-char base32 codec (§2, a 32-byte id each; each well under the
+63-char label limit). The custom DNS responder answers ANY name ending in `.<tld>` (§3), so a
+two-label host resolves fine — it is not bound by real-DNS single-label wildcard semantics.
+More than two labels, an empty label, or a label that is not valid base32 is rejected → 404.
+Parsing is implemented in `dig_dns::host::parse_dig_host` → `HostTarget::{Latest, Pinned}`.
+
+The browsable host is therefore `<label>.<tld>` (latest) or `<rootLabel>.<storeLabel>.<tld>`
+(pinned), e.g. `<52-char-base32>.dig`.
 
 **Rules.**
 
@@ -131,17 +150,27 @@ The store label is taken from the `Host` header (origin-form) or the absolute-UR
 
 ### 4.3 Resolution + serving
 
-For a valid `<label>.<tld>` host and request path `/<path>`:
+For a valid `.dig` host and request path `/<path>`:
 
-1. Decode the label → 64-hex `store_id` (§2).
-2. Map the path to a **resource_key** (§4.4).
-3. Resolve the store's **latest anchored root** and fetch the resource from the dig-node,
-   then verify + decrypt (§8). This yields plaintext bytes or a "not found in this store"
-   outcome.
-4. **SPA catch-all** (§4.5) decides, for a not-found path, whether to serve `/index.html` or
+1. Parse the host into a `HostTarget` (§2.1): `Latest { store_id }` (one label) or
+   `Pinned { store_id, root }` (two labels; the pinned root).
+2. Map the path to a **resource_key** (§4.4) and derive its `retrieval_key` (§8).
+3. Determine the trusted root:
+   - **Latest** → call `dig.getAnchoredRoot { store_id }` to get the current chain-anchored
+     root (§6.1);
+   - **Pinned** → use the root from the host directly (no `getAnchoredRoot`).
+4. Fetch the resource via `dig.getContent { store_id, retrieval_key, root }` (§6.2) and
+   verify + decrypt against the trusted root (§8). This yields plaintext bytes or a "not
+   found in this store" outcome (a decoy/decrypt failure, or a `-32004`/`-32005` node error).
+   For a pinned root, `dig.getContent` serves that exact generation; the served proof MUST
+   fold to the pinned root or the response is refused.
+5. **SPA catch-all** (§4.5) decides, for a not-found path, whether to serve `/index.html` or
    return 404.
-5. Serve the plaintext with a correct `Content-Type` (§4.6), supporting `GET`, `HEAD`, and
+6. Serve the plaintext with a correct `Content-Type` (§4.6), supporting `GET`, `HEAD`, and
    byte-`Range` requests.
+
+A pinned-root host therefore serves that exact generation even after the store has advanced,
+whereas a bare-store host always tracks the latest anchored root.
 
 ### 4.4 Path → resource_key
 
