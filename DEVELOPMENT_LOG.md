@@ -112,6 +112,28 @@ port). Windows gotcha: `Invoke-WebRequest` returns `.Content` as BYTES for the P
 `application/x-ns-proxy-autoconfig` content-type — use `.RawContent` (always a string) when
 grepping PAC output in PowerShell.
 
+## Ensuring `dig.local`: probe-before-bind is race-safe against dig-node's own best-effort bind
+
+dig-node ALSO best-effort binds `http://dig.local` (`127.0.0.2:80`) itself (SYSTEM.md). Rather
+than coordinate startup order between the two services, `dig-dns` just probes
+`GET <dig_local>/health` before binding: whichever of {dig-node's bind, dig-dns's ensure} gets
+there first serves the address, and the OTHER one's probe sees it answering and backs off
+(`EnsureOutcome::AlreadyMapped`) — no explicit locking/coordination needed, and either way a
+request to `dig.local` reaches the real node (directly, or through `dig-dns`'s transparent
+reverse proxy to `http://localhost:9778`). The same probe-before-bind check also makes
+`ensure_dig_local_mapping` idempotent across restarts/retries: it never fights its OWN prior
+listener, because that listener answers `/health` too (via passthrough, or `502` if the node
+behind it is down — reqwest's "any HTTP response counts as reachable" convention, reused
+verbatim from `transport::probe`, means even a `502` counts as "already mapped").
+
+## `http://dig.local` has no PAC-style fallback port
+
+The `.dig` gateway's `:80`→`:8053` fallback works because the PAC file can advertise the
+actually-bound port to the browser. `dig.local` has no such indirection — a plain
+`http://dig.local` request always means port 80 verbatim, with nothing to tell the browser
+otherwise — so a `dig.local`-mapping bind failure has no fallback port to try; the only
+recourse is retrying the SAME port on an interval until it frees up.
+
 ## `serve` runs BOTH paths; the DNS bind is non-fatal
 
 `server::run_service` brings up the gateway AND the DNS responder. The two resolution paths are
