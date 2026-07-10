@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.7.1] - 2026-07-10
+
+### Bug Fixes
+- Install the rustls crypto provider before building a reqwest client in dig.local tests (#8)
+
 ## [0.7.0] - 2026-07-10
 
 ### Features
