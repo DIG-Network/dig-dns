@@ -69,6 +69,19 @@ Control endpoints (also directly on the IP): `GET /.dig/health` (JSON), `GET /.d
 loopback-only, never an open proxy (a non-`.dig` proxy target → `403`), never tunnels CONNECT,
 and never intercepts TLS.
 
+**`http://dig.local` (SPEC §12).** `serve` also ensures, idempotently, that `http://dig.local`
+(default `127.0.0.2:80` — the installer's hosts mapping for "the user's own node", #91) reaches
+the local dig-node: if something already answers there (dig-node's own best-effort bind, or
+dig-dns's own proxy from an earlier start), it does nothing; otherwise it binds a transparent
+reverse proxy there, forwarding every request byte-for-byte to `http://localhost:9778` (or the
+`--node`/`DIG_NODE_URL` override). A bind failure is logged and retried every 30s — never fatal
+to the `.dig` gateway/DNS paths. Override the address for unprivileged local testing:
+
+```sh
+DIG_DNS_LOCAL_IP=127.0.0.1 DIG_DNS_LOCAL_PORT=8180 dig-dns serve --node http://localhost:9778
+curl http://127.0.0.1:8180/health   # relayed straight through to the node
+```
+
 **Acceptance:** per-OS runtime acceptance scripts start `dig-dns serve` on high ports and prove
 `doctor` + the control endpoints + open-proxy `403` + bad-host `404` + the DNS responder (no node
 needed); set `STORE_LABEL`/`ROOT_LABEL` + `NODE` for the content + pinned-vs-latest checks:
@@ -82,8 +95,9 @@ The PAC CLI + README + per-OS acceptance scripts (Phase 5) land next.
 
 **Config** is defaults + environment overrides (see `SPEC.md §7`): `DIG_DNS_IP`,
 `DIG_DNS_DNS_PORT`, `DIG_DNS_HTTP_PORT`, `DIG_DNS_HTTP_FALLBACK_PORT`, `DIG_DNS_TLD`,
-`DIG_DNS_TTL`, and `DIG_NODE_URL` (node endpoint override; empty ⇒ the
-`dig.local → localhost:9778 → rpc.dig.net` ladder).
+`DIG_DNS_TTL`, `DIG_NODE_URL` (node endpoint override; empty ⇒ the
+`dig.local → localhost:9778 → rpc.dig.net` ladder), and `DIG_DNS_LOCAL_IP`/`DIG_DNS_LOCAL_PORT`
+(the ensured `dig.local` reverse-proxy address, default `127.0.0.2:80`, SPEC §12).
 
 ## Deployment / release
 

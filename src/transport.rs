@@ -139,7 +139,10 @@ fn build_http_client() -> Result<reqwest::Client, NodeError> {
 
 /// Probe `GET <base>/health` with a short timeout — any HTTP response (even non-2xx) counts
 /// as "the tier answered"; a connection/timeout error falls through to the next tier.
-async fn probe(http: &reqwest::Client, base: &str) -> bool {
+///
+/// `pub(crate)` so [`crate::server`]'s `dig.local`-mapping check (SPEC §12.1 step 1) reuses the
+/// SAME "any HTTP response = reachable" convention rather than duplicating it.
+pub(crate) async fn probe(http: &reqwest::Client, base: &str) -> bool {
     http.get(format!("{base}/health"))
         .timeout(PROBE_TIMEOUT)
         .send()

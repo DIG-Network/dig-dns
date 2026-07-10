@@ -29,6 +29,12 @@ pub const DEFAULT_TLD: &str = "dig";
 /// Default TTL (seconds) on DNS answers — short so a re-point/uninstall takes effect fast
 /// (SPEC §3: 1–5s).
 pub const DEFAULT_DNS_TTL_SECS: u32 = 2;
+/// Default IP the installer maps the `dig.local` hostname to (SYSTEM.md dig-node section,
+/// #91) — matches dig-node's own best-effort bind for `http://dig.local` (SPEC §12).
+pub const DEFAULT_DIG_LOCAL_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
+/// The `http://dig.local` implied port. DNS carries no port, so a plain `http://dig.local` URL
+/// always means `:80` in production; overridable only for unprivileged local testing (SPEC §12).
+pub const DEFAULT_DIG_LOCAL_PORT: u16 = 80;
 
 /// Environment variable naming the dig-node endpoint (ecosystem-standard, §5.3). When set
 /// it overrides the node-resolution ladder.
@@ -45,6 +51,10 @@ pub const ENV_HTTP_FALLBACK_PORT: &str = "DIG_DNS_HTTP_FALLBACK_PORT";
 pub const ENV_TLD: &str = "DIG_DNS_TLD";
 /// Environment variable for the DNS answer TTL (seconds).
 pub const ENV_DNS_TTL: &str = "DIG_DNS_TTL";
+/// Environment variable for the `dig.local` reverse-proxy bind IP (SPEC §12).
+pub const ENV_DIG_LOCAL_IP: &str = "DIG_DNS_LOCAL_IP";
+/// Environment variable for the `dig.local` reverse-proxy bind port (SPEC §12).
+pub const ENV_DIG_LOCAL_PORT: &str = "DIG_DNS_LOCAL_PORT";
 
 /// A fully-resolved, validated `dig-dns` configuration.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -64,6 +74,12 @@ pub struct Config {
     /// An explicit dig-node endpoint that overrides the §5.3 resolution ladder. `None`
     /// means "use the ladder" (dig.local → localhost → rpc.dig.net).
     pub node_url: Option<String>,
+    /// The bind IP for the `dig.local` reverse proxy (SPEC §12) — the address the installer
+    /// maps the `dig.local` hostname to (default `127.0.0.2`, #91).
+    pub dig_local_ip: Ipv4Addr,
+    /// The bind port for the `dig.local` reverse proxy (SPEC §12). `http://dig.local` has no
+    /// port suffix, so this MUST stay `80` in production.
+    pub dig_local_port: u16,
 }
 
 /// Errors from building/validating a [`Config`].
@@ -96,6 +112,8 @@ impl Default for Config {
             tld: DEFAULT_TLD.to_string(),
             dns_ttl_secs: DEFAULT_DNS_TTL_SECS,
             node_url: None,
+            dig_local_ip: DEFAULT_DIG_LOCAL_IP,
+            dig_local_port: DEFAULT_DIG_LOCAL_PORT,
         }
     }
 }
@@ -106,10 +124,14 @@ impl Config {
         if !self.loopback_ip.is_loopback() {
             return Err(ConfigError::NotLoopback(self.loopback_ip));
         }
+        if !self.dig_local_ip.is_loopback() {
+            return Err(ConfigError::NotLoopback(self.dig_local_ip));
+        }
         for (key, port) in [
             (ENV_DNS_PORT, self.dns_port),
             (ENV_HTTP_PORT, self.http_port),
             (ENV_HTTP_FALLBACK_PORT, self.http_fallback_port),
+            (ENV_DIG_LOCAL_PORT, self.dig_local_port),
         ] {
             if port == 0 {
                 return Err(ConfigError::InvalidPort {
@@ -193,6 +215,15 @@ where
     }
     // A blank node URL means "use the ladder", not an explicit empty endpoint.
     cfg.node_url = resolve_node_override(None, get(ENV_NODE_URL).as_deref(), None);
+    if let Some(v) = get(ENV_DIG_LOCAL_IP) {
+        cfg.dig_local_ip = v.trim().parse().map_err(|_| ConfigError::InvalidIp {
+            key: ENV_DIG_LOCAL_IP,
+            value: v.clone(),
+        })?;
+    }
+    if let Some(v) = get(ENV_DIG_LOCAL_PORT) {
+        cfg.dig_local_port = parse_port(ENV_DIG_LOCAL_PORT, &v)?;
+    }
 
     cfg.validate()?;
     Ok(cfg)
@@ -222,6 +253,8 @@ mod tests {
         assert_eq!(c.tld, "dig");
         assert_eq!(c.dns_ttl_secs, 2);
         assert_eq!(c.node_url, None);
+        assert_eq!(c.dig_local_ip, Ipv4Addr::new(127, 0, 0, 2));
+        assert_eq!(c.dig_local_port, 80);
         assert!(c.validate().is_ok());
     }
 
@@ -241,6 +274,8 @@ mod tests {
             (ENV_TLD, "DIG"),
             (ENV_DNS_TTL, "5"),
             (ENV_NODE_URL, "http://127.0.0.1:9778"),
+            (ENV_DIG_LOCAL_IP, "127.0.0.3"),
+            (ENV_DIG_LOCAL_PORT, "8080"),
         ]))
         .unwrap();
         assert_eq!(c.loopback_ip, Ipv4Addr::new(127, 0, 0, 9));
@@ -250,11 +285,19 @@ mod tests {
         assert_eq!(c.tld, "dig"); // lowercased
         assert_eq!(c.dns_ttl_secs, 5);
         assert_eq!(c.node_url.as_deref(), Some("http://127.0.0.1:9778"));
+        assert_eq!(c.dig_local_ip, Ipv4Addr::new(127, 0, 0, 3));
+        assert_eq!(c.dig_local_port, 8080);
     }
 
     #[test]
     fn from_env_rejects_non_loopback_bind_ip() {
         let err = from_env(env_of(&[(ENV_IP, "10.0.0.1")])).unwrap_err();
+        assert_eq!(err, ConfigError::NotLoopback(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn from_env_rejects_non_loopback_dig_local_ip() {
+        let err = from_env(env_of(&[(ENV_DIG_LOCAL_IP, "10.0.0.1")])).unwrap_err();
         assert_eq!(err, ConfigError::NotLoopback(Ipv4Addr::new(10, 0, 0, 1)));
     }
 
@@ -266,6 +309,10 @@ mod tests {
         ));
         assert!(matches!(
             from_env(env_of(&[(ENV_HTTP_PORT, "notaport")])).unwrap_err(),
+            ConfigError::InvalidPort { .. }
+        ));
+        assert!(matches!(
+            from_env(env_of(&[(ENV_DIG_LOCAL_PORT, "0")])).unwrap_err(),
             ConfigError::InvalidPort { .. }
         ));
     }
