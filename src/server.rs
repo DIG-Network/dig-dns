@@ -345,6 +345,11 @@ pub async fn ensure_dig_local_mapping(
     config: &Config,
     shutdown: impl Future<Output = ()>,
 ) -> EnsureOutcome {
+    // Every entry point that builds a `reqwest::Client` installs the rustls crypto provider
+    // first (idempotent `Once`) — the SAME defensive call `ReqwestNodeClient::{resolve,
+    // with_base}` make, so this function is correct even when called before `run_service`'s own
+    // (also-present) `init_crypto()` call, e.g. directly from a test.
+    crate::transport::init_crypto();
     let http = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(30))
@@ -679,6 +684,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_and_bind_dig_local_binds_when_absent() {
+        crate::transport::init_crypto();
         // Reserve then free an ephemeral port so it is free for the ensure() call.
         let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = reserve.local_addr().unwrap().port();
@@ -699,6 +705,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_and_bind_dig_local_already_mapped_is_a_noop() {
+        crate::transport::init_crypto();
         // Spin a tiny stub that answers ANY request (models dig-node's own /health bind, or a
         // dig-dns proxy still running from an earlier start).
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -734,6 +741,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_and_bind_dig_local_is_idempotent_across_repeated_calls() {
+        crate::transport::init_crypto();
         // First call: absent -> Established (binds + holds the listener).
         let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = reserve.local_addr().unwrap().port();
