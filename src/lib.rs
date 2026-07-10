@@ -26,8 +26,11 @@
 //!   control), the never-an-open-proxy rules, `/.dig/` control endpoints, and resolve+serve.
 //! - [`dns`] — the DNS responder wire codec + answering policy (PURE): `*.<tld>`/apex → `A`
 //!   loopback, AAAA/other → NODATA, non-`.<tld>` → REFUSED, EDNS0/TC (SPEC §3).
+//! - [`dig_local`] — ensuring `http://dig.local` reaches the local dig-node (SPEC §12, PURE):
+//!   the idempotent ensure decision + reverse-proxy target discovery (never `rpc.dig.net`).
 //! - [`server`] — the listener glue: bind the gateway (with the `:8053` fallback) + the DNS
-//!   responder (`:53`, UDP+TCP), accept, and adapt hyper requests to [`gateway::handle`].
+//!   responder (`:53`, UDP+TCP) + the ensured `dig.local` reverse proxy, accept, and adapt
+//!   hyper requests to [`gateway::handle`].
 //! - [`doctor`] — the `doctor` diagnostic (SPEC §9): independent per-link checks of both paths
 //!   with fix hints + `--json`, exiting non-zero when a `.dig` URL cannot load.
 //! - [`pac`] — Proxy Auto-Config generation for Path B (the PAC control endpoint + CLI).
@@ -43,6 +46,7 @@
 pub mod cli;
 pub mod config;
 pub mod content;
+pub mod dig_local;
 pub mod dns;
 pub mod doctor;
 pub mod gateway;

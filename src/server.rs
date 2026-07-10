@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{HOST, RANGE};
 use hyper::server::conn::http1;
@@ -26,9 +26,14 @@ use tokio::net::{TcpListener, UdpSocket};
 use hyper::Uri;
 
 use crate::config::Config;
+use crate::dig_local::{self, EnsureOutcome};
 use crate::dns::{self, Transport};
 use crate::gateway::{handle, Ctx, GatewayResponse};
 use crate::transport::{NodeClient, ReqwestNodeClient};
+
+/// How long between `dig.local`-mapping retries after a bind failure (SPEC §12.1 step 3): the
+/// loopback alias or a transient port holder may not be ready yet at `dig-dns` startup.
+const DIG_LOCAL_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A boxed error from the server bring-up (node resolution or socket bind).
 pub type ServerError = Box<dyn std::error::Error + Send + Sync>;
@@ -293,11 +298,257 @@ pub async fn run_service(config: Config) -> Result<(), ServerError> {
         });
     }
 
+    // Ensure http://dig.local reaches the local dig-node too (SPEC §12) — independent of, and
+    // non-fatal relative to, the .dig gateway/DNS paths above.
+    spawn_dig_local_ensure(config.clone());
+
     serve_on(listener, client, ctx, async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await;
     Ok(())
+}
+
+/// Probe-then-bind-if-absent (SPEC §12.1 steps 1–2): the idempotency check + bind, isolated
+/// from serving so it is directly unit-testable with real ephemeral loopback sockets (no
+/// privilege, no dependency on the real `127.0.0.2` alias). Returns the listener only on
+/// `Established` — the caller decides whether/how to serve it.
+async fn probe_and_bind_dig_local(
+    http: &reqwest::Client,
+    ip: Ipv4Addr,
+    port: u16,
+) -> (EnsureOutcome, Option<TcpListener>) {
+    if crate::transport::probe(http, &format!("http://{ip}:{port}")).await {
+        return (EnsureOutcome::AlreadyMapped, None);
+    }
+    match TcpListener::bind(SocketAddr::from((ip, port))).await {
+        Ok(listener) => {
+            let bound_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+            (EnsureOutcome::Established { bound_port }, Some(listener))
+        }
+        Err(e) => (
+            EnsureOutcome::Unavailable {
+                reason: e.to_string(),
+            },
+            None,
+        ),
+    }
+}
+
+/// Ensure `http://dig.local` reaches the local dig-node (SPEC §12): one attempt — probe, and if
+/// absent, bind + serve a transparent reverse proxy to the discovered local-node target UNTIL
+/// `shutdown` resolves. Returns immediately for `AlreadyMapped`/`Unavailable`; for `Established`
+/// this call does not return until `shutdown` resolves (mirrors `serve_on`'s bind-then-serve
+/// shape). Public so both [`run_service`] and the integration test drive the exact same path
+/// over real loopback sockets.
+pub async fn ensure_dig_local_mapping(
+    config: &Config,
+    shutdown: impl Future<Output = ()>,
+) -> EnsureOutcome {
+    let http = match reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "dig.local: failed to build HTTP client");
+            return EnsureOutcome::Unavailable {
+                reason: e.to_string(),
+            };
+        }
+    };
+    let (outcome, listener) =
+        probe_and_bind_dig_local(&http, config.dig_local_ip, config.dig_local_port).await;
+    match &outcome {
+        EnsureOutcome::AlreadyMapped => {
+            tracing::info!(
+                ip = %config.dig_local_ip,
+                port = config.dig_local_port,
+                "http://dig.local already reaches a dig-node; leaving it"
+            );
+        }
+        EnsureOutcome::Established { bound_port } => {
+            let target = dig_local::local_node_target(config);
+            tracing::info!(
+                ip = %config.dig_local_ip,
+                bound_port,
+                target = %target,
+                "ensured http://dig.local reaches the local dig-node"
+            );
+            if let Some(listener) = listener {
+                serve_dig_local_proxy(listener, http, target, shutdown).await;
+            }
+        }
+        EnsureOutcome::Unavailable { reason } => {
+            tracing::warn!(
+                reason = %reason,
+                ip = %config.dig_local_ip,
+                port = config.dig_local_port,
+                "could not ensure http://dig.local (non-fatal; the .dig gateway still serves)"
+            );
+        }
+    }
+    outcome
+}
+
+/// Spawn [`ensure_dig_local_mapping`] fire-and-forget from [`run_service`], retrying on
+/// [`DIG_LOCAL_RETRY_INTERVAL`] only when it reports `Unavailable` (a transient bind failure —
+/// the loopback alias not up yet, or a stale holder that exits shortly) — self-healing without
+/// restarting `dig-dns`. `AlreadyMapped` and `Established` need no retry: the former is already
+/// satisfied, the latter has already served until Ctrl-C by the time it returns.
+fn spawn_dig_local_ensure(config: Config) {
+    tokio::spawn(async move {
+        loop {
+            let outcome = ensure_dig_local_mapping(&config, async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await;
+            match outcome {
+                EnsureOutcome::Unavailable { .. } => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => return,
+                        _ = tokio::time::sleep(DIG_LOCAL_RETRY_INTERVAL) => {}
+                    }
+                }
+                EnsureOutcome::AlreadyMapped | EnsureOutcome::Established { .. } => return,
+            }
+        }
+    });
+}
+
+/// Serve the `dig.local` transparent reverse proxy on an already-bound listener until
+/// `shutdown` resolves (SPEC §12.1 step 2). Every request is forwarded byte-for-byte (method,
+/// path+query, headers minus hop-by-hop, body) to `target_base` and the response relayed back
+/// unmodified — `dig.local` is the node's OWN control host (JSON-RPC `POST /`, `GET /health`,
+/// …), not `.dig` store content, so this is a plain passthrough, never the gateway's
+/// verify-then-decrypt path.
+async fn serve_dig_local_proxy(
+    listener: TcpListener,
+    http: reqwest::Client,
+    target_base: String,
+    shutdown: impl Future<Output = ()>,
+) {
+    let target = Arc::new(target_base);
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                tracing::info!("dig.local proxy shutting down");
+                break;
+            }
+            accepted = listener.accept() => {
+                let (stream, _peer) = match accepted {
+                    Ok(pair) => pair,
+                    Err(e) => { tracing::warn!(error = %e, "dig.local accept failed"); continue; }
+                };
+                let io = TokioIo::new(stream);
+                let http = http.clone();
+                let target = target.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req| {
+                        let http = http.clone();
+                        let target = target.clone();
+                        async move { Ok::<_, Infallible>(proxy_respond(&http, &target, req).await) }
+                    });
+                    if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+                        tracing::debug!(error = %e, "dig.local connection closed with error");
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Forward one hyper request to `target_base`, verbatim (method, path+query, headers minus
+/// hop-by-hop, body), and convert the response back — a plain relay, never touching bytes.
+async fn proxy_respond(
+    http: &reqwest::Client,
+    target_base: &str,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let method = match reqwest::Method::from_bytes(req.method().as_str().as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return proxy_text(400, "invalid method"),
+    };
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/")
+        .to_string();
+    let headers = req.headers().clone();
+    let body = req
+        .into_body()
+        .collect()
+        .await
+        .map(|c| c.to_bytes())
+        .unwrap_or_default();
+
+    let url = format!("{target_base}{path_and_query}");
+    let mut builder = http.request(method, &url);
+    for (name, value) in headers.iter() {
+        if is_hop_by_hop_header(name.as_str()) {
+            continue;
+        }
+        if let Ok(v) = value.to_str() {
+            builder = builder.header(name.as_str(), v);
+        }
+    }
+    if !body.is_empty() {
+        builder = builder.body(body.to_vec());
+    }
+
+    match builder.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let mut out = Response::builder().status(status);
+            for (name, value) in resp.headers().iter() {
+                if is_hop_by_hop_header(name.as_str()) {
+                    continue;
+                }
+                out = out.header(name.as_str(), value.as_bytes());
+            }
+            let bytes = resp.bytes().await.unwrap_or_default();
+            out.body(Full::new(bytes))
+                .unwrap_or_else(|_| proxy_text(500, "internal error"))
+        }
+        Err(_) => proxy_text(502, "dig-node unreachable"),
+    }
+}
+
+/// Hop-by-hop / connection-management headers a proxy must never blindly relay (RFC 9110
+/// §7.6.1) — `content-length`/`transfer-encoding` are recomputed by the HTTP layers on each
+/// side, and `host` must name the TARGET, not the original request's authority.
+fn is_hop_by_hop_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "host"
+            | "connection"
+            | "content-length"
+            | "transfer-encoding"
+            | "keep-alive"
+            | "proxy-connection"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "upgrade"
+    )
+}
+
+/// A short `text/plain` response for a proxy-local error (never something the node itself sent).
+fn proxy_text(status: u16, msg: &str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Full::new(Bytes::from(msg.to_string())))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(500)
+                .body(Full::new(Bytes::from_static(b"internal error")))
+                .expect("static 500 response is valid")
+        })
 }
 
 /// Probe a running gateway for its actually-bound port: try `/.dig/resolve-probe` on the
@@ -424,6 +675,109 @@ mod tests {
             .unwrap();
         assert!(used_fallback);
         assert_ne!(port, primary.port());
+    }
+
+    #[tokio::test]
+    async fn probe_and_bind_dig_local_binds_when_absent() {
+        // Reserve then free an ephemeral port so it is free for the ensure() call.
+        let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = reserve.local_addr().unwrap().port();
+        drop(reserve);
+
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let (outcome, listener) =
+            probe_and_bind_dig_local(&http, Ipv4Addr::new(127, 0, 0, 1), port).await;
+        assert_eq!(outcome, EnsureOutcome::Established { bound_port: port });
+        assert!(
+            listener.is_some(),
+            "Established must hand back the listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_and_bind_dig_local_already_mapped_is_a_noop() {
+        // Spin a tiny stub that answers ANY request (models dig-node's own /health bind, or a
+        // dig-dns proxy still running from an earlier start).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(|_req: Request<Incoming>| async {
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
+        });
+
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let (outcome, listener) =
+            probe_and_bind_dig_local(&http, Ipv4Addr::new(127, 0, 0, 1), addr.port()).await;
+        assert_eq!(outcome, EnsureOutcome::AlreadyMapped);
+        assert!(
+            listener.is_none(),
+            "already-mapped must never bind a second listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_and_bind_dig_local_is_idempotent_across_repeated_calls() {
+        // First call: absent -> Established (binds + holds the listener).
+        let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = reserve.local_addr().unwrap().port();
+        drop(reserve);
+
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let (first, listener) =
+            probe_and_bind_dig_local(&http, Ipv4Addr::new(127, 0, 0, 1), port).await;
+        assert_eq!(first, EnsureOutcome::Established { bound_port: port });
+        let listener = listener.expect("first call binds");
+
+        // Serve it minimally (answers anything) so the second call's probe finds it live.
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(|_req: Request<Incoming>| async {
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
+        });
+
+        // Second call against the SAME address: must be a no-op, never attempt another bind.
+        let http2 = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let (second, listener2) =
+            probe_and_bind_dig_local(&http2, Ipv4Addr::new(127, 0, 0, 1), port).await;
+        assert_eq!(
+            second,
+            EnsureOutcome::AlreadyMapped,
+            "re-running is safe: no duplicate bind"
+        );
+        assert!(listener2.is_none());
     }
 
     #[test]

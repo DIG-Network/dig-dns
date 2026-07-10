@@ -34,6 +34,11 @@ Because a browser can bypass the OS resolver (DNS-over-HTTPS, its own built-in r
 
 The `doctor` subcommand (§9) checks each link of each path independently.
 
+`dig-dns` also, independently, ENSURES a THIRD address reaches the local dig-node:
+`http://dig.local` (the installer-mapped control host, default `127.0.0.2:80` — distinct from
+the dedicated `127.0.0.5` above). This is a plain reverse proxy, not a `.dig` store lookup; see
+§12.
+
 ---
 
 ## 2. The `.dig` DNS-label ↔ storeId codec
@@ -336,6 +341,8 @@ endpoint, a CLI flag). Values are validated on load; an invalid value is a start
 | TLD | `dig` | `DIG_DNS_TLD` | normalised: trim, strip leading `.`, lowercase |
 | DNS TTL (s) | `2` | `DIG_DNS_TTL` | 1–5 |
 | node endpoint override | (ladder) | `DIG_NODE_URL` | empty ⇒ use the §6.3 ladder |
+| `dig.local` bind IP | `127.0.0.2` | `DIG_DNS_LOCAL_IP` | MUST be `127.0.0.0/8`; matches the installer's `dig.local` hosts registration (#91) and dig-node's own best-effort bind (§12) |
+| `dig.local` bind port | `80` | `DIG_DNS_LOCAL_PORT` | `http://dig.local` has no port suffix, so this MUST stay `80` in production; overridable for unprivileged local testing (§12) |
 
 ---
 
@@ -417,6 +424,67 @@ At least one of {Path A end-to-end, Path B (PAC + gateway)} passing means a `.di
 
 ---
 
+## 12. Ensuring `http://dig.local` reaches the local dig-node
+
+`dig.local` is the OS-hosts-mapped name for "the user's own dig-node" (§5.3/§6.3 tier 1 of the
+client→node ladder; the installer registers it, out of scope here — #91). DNS resolves a name
+to an IP only, never a port, so `http://dig.local` implies port **80** at whatever IP the hosts
+file maps it to (default `127.0.0.2`, matching dig-node's own best-effort bind, SYSTEM.md).
+`dig-dns` — already the service responsible for making a hostname reach the node over HTTP for
+`.dig` — additionally ENSURES this specific mapping too, idempotently.
+
+### 12.1 Mechanism: an ensured transparent reverse proxy
+
+On `serve` startup (and thereafter on a retry interval if needed), `dig-dns`:
+
+1. Probes `GET http://<dig_local_ip>:<dig_local_port>/health` (default `127.0.0.2:80`) with a
+   short timeout. ANY HTTP response (even non-2xx) means something is already answering there —
+   dig-node's own best-effort bind, or `dig-dns`'s own reverse proxy still running from an
+   earlier start — and `dig-dns` does **nothing further** (idempotent no-op:
+   [`EnsureOutcome::AlreadyMapped`]).
+2. If nothing answers, `dig-dns` binds a listener at `<dig_local_ip>:<dig_local_port>` itself
+   and serves a TRANSPARENT reverse proxy there ([`EnsureOutcome::Established`]): every request
+   (any method, path+query, headers minus hop-by-hop, body) is forwarded byte-for-byte to the
+   discovered local dig-node target (§12.2) and the response relayed back unmodified. Unlike
+   the `.dig` gateway (§4), this is NOT the verify-then-decrypt content path — `dig.local` is
+   the node's OWN control/root host (JSON-RPC `POST /`, `GET /health`, …), so `dig-dns` only
+   relays bytes.
+3. If the bind itself fails ([`EnsureOutcome::Unavailable`] — the address genuinely held by
+   something unrelated, or insufficient privilege), `dig-dns` logs a warning and retries on a
+   fixed interval (30s) until it either binds or detects the address already answering. It
+   never crashes the service; the `.dig` gateway + DNS responder keep serving regardless.
+
+Because step 1 always precedes step 2, and step 2's own listener answers `/health` via
+passthrough (or `502` when the node is down), a second `ensure` attempt — a restart, or a retry
+tick — always finds "already mapped" and never double-binds. This is also RACE-SAFE against
+dig-node's own best-effort bind: whichever of the two gets there first serves `dig.local`, and
+either way requests reach the node (directly, or via `dig-dns`'s transparent proxy).
+
+A node that is down (or not yet started) is handled gracefully: the listener still binds (it
+does not need the node to be up), and each proxied request independently attempts the target,
+`502`-ing "dig-node unreachable" until the node appears — the mapping self-heals with no
+restart and no separate liveness loop.
+
+### 12.2 Target discovery — the local node ONLY, never `rpc.dig.net`
+
+The reverse-proxy TARGET is resolved like the §6.3 ladder's override tier, but WITHOUT the
+`rpc.dig.net` terminal fallback — `dig.local` names the user's OWN node; proxying it to the
+public gateway would defeat the purpose of an ensured LOCAL mapping:
+
+1. an explicit override (`--node` / `DIG_NODE_URL` / config `node.url`) wins entirely; else
+2. `http://localhost:<DEFAULT_LOCAL_NODE_PORT>` (`9778`) — the local node's always-on port.
+
+Implemented in `dig_local::local_node_target`.
+
+### 12.3 No fallback port
+
+Unlike the `.dig` gateway (§4, deterministic `:8053` fallback advertised via the PAC file), the
+`dig.local` reverse proxy has **no fallback port**: a plain `http://dig.local` URL has no
+proxy indirection to advertise an alternate port to, so a bind must succeed on the CONFIGURED
+port (§7) or the retry loop (§12.1 step 3) keeps trying the same port.
+
+---
+
 ## Appendix A — default ports / addresses
 
 | Service | Address | Transport |
@@ -424,5 +492,5 @@ At least one of {Path A end-to-end, Path B (PAC + gateway)} passing means a `.di
 | dig-dns DNS responder | `127.0.0.5:53` | UDP + TCP |
 | dig-dns HTTP gateway | `127.0.0.5:80` (fallback `127.0.0.5:8053`) | HTTP |
 | dig-node control RPC (localhost tier) | `127.0.0.1:9778` | HTTP (JSON-RPC) |
-| dig-node `dig.local` tier | `127.0.0.2:80` | HTTP |
+| dig-node `dig.local` tier — dig-node's own best-effort bind, OR `dig-dns`'s ensured reverse proxy (§12) | `127.0.0.2:80` | HTTP |
 | public gateway fallback | `rpc.dig.net:443` | HTTPS |
