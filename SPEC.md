@@ -485,6 +485,62 @@ port (§7) or the retry loop (§12.1 step 3) keeps trying the same port.
 
 ---
 
+## 13. OS-service registration
+
+`dig-dns` installs as an auto-starting OS service that runs `dig-dns serve`. The service
+BINARY owns its own registration (the installer invokes `dig-dns install`); registration is
+identical across platforms via the `service-manager` crate (Windows SCM, Linux systemd, macOS
+launchd).
+
+### 13.1 Canonical identity
+
+| | Value |
+|---|---|
+| Service id (name) | `net.dignetwork.dig-dns` |
+| Windows display name | `DIG NETWORK: DNS` |
+
+- The **service id** is a reverse-DNS name used VERBATIM as the Windows SCM service name
+  (`sc create`/`query`/`start`/`stop`/`delete`), the launchd plist label, and the systemd unit
+  name (`net.dignetwork.dig-dns.service`). It MUST match the sibling convention
+  `net.dignetwork.dig-node` used by the dig-node service.
+- The **display name** is the human-friendly name shown in the Windows Services console. On
+  Windows it is set with `sc config <id> displayname= "DIG NETWORK: DNS"` AFTER create (the
+  underlying `sc create` sets the display name to the id). On launchd/systemd the service id is
+  the visible name, so the display name is Windows-facing.
+
+### 13.2 Clean-reinstall (normative)
+
+`install` performs a CLEAN RECREATE, never a reconfigure-in-place. If the service ALREADY
+EXISTS, it MUST:
+
+1. **stop** the running service (best-effort — a stopped service is not an error);
+2. **delete** (deregister) it;
+3. **wait** for the removal to take effect (a Windows deletion can linger until open handles
+   close), bounded by a timeout;
+4. **create** it afresh (with the display name on Windows);
+5. **start** it.
+
+When no prior registration exists it simply creates + starts. Deleting before creating is what
+prevents Windows `CreateService 1073 "the specified service already exists"` on an installer
+re-run. Per OS the primitives are: Windows `sc stop`/`sc delete`/`sc create`/`sc start`; macOS
+launchd `bootout`/`bootstrap`; Linux systemd `stop`+`disable` then reinstall the unit +
+`enable --now` — all provided by `service-manager` plus the Windows display-name override.
+
+### 13.3 Command surface
+
+| Command | Effect |
+|---|---|
+| `dig-dns install [--node URL]` | Register (clean-reinstall) + start the service; bakes the resolved config into the service environment. Windows requires an elevated console. |
+| `dig-dns uninstall` | Stop + deregister the service. Windows requires elevation. |
+| `dig-dns start` / `dig-dns stop` | Start / stop the registered service. |
+| `dig-dns status` | Report whether the resolver is serving (probes `GET /.dig/resolve-probe` on the bound port) + whether it is registered. Exits non-zero when nothing is serving. |
+| `dig-dns run-service` | (hidden, Windows only) The SCM protocol entrypoint the installed service launches; speaks `StartServiceCtrlDispatcher` so the SCM does not kill it with error 1053. Behaves like `serve` off Windows. |
+
+Every command supports `--json` (§10). Install level: user-level (no elevation) on Linux/macOS;
+system-level on Windows (SCM has no per-user services).
+
+---
+
 ## Appendix A — default ports / addresses
 
 | Service | Address | Transport |
