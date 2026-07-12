@@ -32,9 +32,13 @@ env:
   CARGO_PROFILE_RELEASE_DEBUG: "0"
 
 jobs:
-  # Gate: a tag that doesn't pass fmt + clippy + tests never produces release binaries.
+  # Gate: fmt + clippy only. The merged tree already passed the full release-gate suite
+  # (fmt/clippy/nextest+coverage/build, CLAUDE.md §2.4a) on the PR before merge, so this
+  # does NOT re-run the test suite — a deploy-time test re-run is redundant and a pure
+  # flake-exposure surface that has blocked releases before (CLAUDE.md #489/#488). This
+  # stays a fast sanity check that the tagged tree still builds cleanly.
   check:
-    name: fmt + clippy + test
+    name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,7 +52,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
-      - run: cargo test --locked
 
   build:
     name: build (${{ matrix.out_name }})

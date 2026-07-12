@@ -62,10 +62,14 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      # Run the whole test suite AND gate line coverage at >=80% (CLAUDE.md §2.3) in one
-      # instrumented build. A build below the floor FAILS.
-      - name: cargo llvm-cov (test + coverage, gated >=80%)
-        run: cargo llvm-cov --all-features --fail-under-lines 80 --summary-only | tee coverage-summary.txt
+      # cargo-nextest natively retries a failing test and reports it as "flaky" (failed
+      # then passed) instead of a hard CI failure, surfacing flake without hiding it
+      # (CLAUDE.md #489). Retries run inside the llvm-cov-instrumented nextest run so
+      # coverage gating (>=80%, CLAUDE.md §2.3) still applies to the whole suite.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: cargo llvm-cov nextest (test + coverage, gated >=80%, retries=2)
+        run: cargo llvm-cov nextest --all-features --fail-under-lines 80 --summary-only --retries 2 | tee coverage-summary.txt
       - name: Coverage summary to job summary
         if: always()
         run: |
