@@ -10,7 +10,7 @@
 # root and increase on every PR (CLAUDE.md §2.4 / §3.6).
 [package]
 name = "dig-dns"
-version = "0.7.2"
+version = "0.8.0"
 edition = "2021"
 description = "Local *.dig name resolution: a DNS responder + HTTP gateway resolving <storeId>.dig to DIG store content via a dig-node."
 license = "GPL-2.0-only"
@@ -53,6 +53,9 @@ tokio = { version = "1", features = [
     "time",
     "signal",
     "io-util",
+    # `sync` = the watch channel that fans one shutdown signal out to every serve subtask
+    # (gateway + DNS + dig.local), so a Windows-service Stop tears the whole service down.
+    "sync",
 ] }
 # The HTTP/1.1 server for the gateway. Raw hyper (not axum) because the gateway must see
 # absolute-form proxy URIs + the CONNECT method to enforce the "never an open proxy" rule
@@ -81,6 +84,18 @@ rustls = { version = "0.23", default-features = false, features = [
 # Structured, loud logging (which port bound, the resolved node tier) for the OS service.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# OS-service registration across Windows (SCM), Linux (systemd) and macOS (launchd) — the SAME
+# crate + version the sibling dig-node service uses, so it cross-compiles to every release
+# target the way dig-node's already does. `dig-dns install` registers the service; the
+# clean-reinstall (stop → delete → recreate) lives in `src/service.rs`.
+service-manager = "0.7"
+
+# Windows Service Control Protocol. service-manager only REGISTERS the service in the SCM; the
+# executable the SCM launches must itself speak the service protocol (StartServiceCtrlDispatcher)
+# or the SCM kills it with error 1053. `src/win_service.rs` (the `run-service` entrypoint) is
+# that dispatcher. Windows-only, so it never enters the non-Windows build/coverage.
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
 
 [dev-dependencies]
 # The integration test spins a real stub dig-node (hyper) + drives the real gateway over

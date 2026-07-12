@@ -237,11 +237,30 @@ async fn handle_dns_tcp(
     Ok(())
 }
 
-/// Resolve the node (§5.3 ladder), bind the HTTP gateway (with the `:8053` fallback) AND the
-/// DNS responder (`:53`), log loudly, and serve both until Ctrl-C. This is the `dig-dns serve`
-/// entry point. The two resolution paths are independent: a DNS `:53` bind failure (e.g.
-/// unprivileged, or `:53` held) is NON-fatal — the gateway + PAC (Path B) still serve `.dig`.
+/// The `dig-dns serve` entry point (and the unix service entrypoint): resolve + bind + serve
+/// both paths until **Ctrl-C**. A thin wrapper over [`serve_with_shutdown`] with a Ctrl-C
+/// shutdown trigger.
 pub async fn run_service(config: Config) -> Result<(), ServerError> {
+    serve_with_shutdown(config, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await
+}
+
+/// Resolve the node (§5.3 ladder), bind the HTTP gateway (with the `:8053` fallback) AND the
+/// DNS responder (`:53`), log loudly, and serve both until `shutdown` resolves. The two
+/// resolution paths are independent: a DNS `:53` bind failure (e.g. unprivileged, or `:53`
+/// held) is NON-fatal — the gateway + PAC (Path B) still serve `.dig`.
+///
+/// `shutdown` is fanned out to EVERY subtask (the gateway accept loop, the DNS responder, and
+/// the `dig.local` ensure loop) through one shared [`tokio::sync::watch`] flag, so a single
+/// signal stops all of them gracefully. [`run_service`] passes Ctrl-C; the Windows-service
+/// entrypoint ([`crate::win_service`], Windows only) passes the SCM `Stop` control — so a
+/// service stop tears down the whole service, not just the foreground process.
+pub async fn serve_with_shutdown(
+    config: Config,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), ServerError> {
     crate::transport::init_crypto();
     let client = Arc::new(ReqwestNodeClient::resolve(&config).await?);
     let primary = SocketAddr::from((config.loopback_ip, config.http_port));
@@ -286,27 +305,47 @@ pub async fn run_service(config: Config) -> Result<(), ServerError> {
         );
     }
 
+    // One shared shutdown, fanned out to every subtask: flip the watch when `shutdown`
+    // resolves; each subtask waits for the flag. `watch` (not `Notify`) so a subtask that
+    // subscribes after the trigger still observes it — no lost-wakeup race on a fast stop.
+    let (shutdown_tx, _keep) = tokio::sync::watch::channel(false);
+    {
+        let tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            shutdown.await;
+            let _ = tx.send(true);
+        });
+    }
+
     if let Ok((udp, tcp)) = dns {
         let ip = config.loopback_ip;
         let tld = config.tld.clone();
         let ttl = config.dns_ttl_secs;
+        let wait = wait_for_shutdown(shutdown_tx.subscribe());
         tokio::spawn(async move {
-            serve_dns(udp, tcp, ip, tld, ttl, async {
-                let _ = tokio::signal::ctrl_c().await;
-            })
-            .await;
+            serve_dns(udp, tcp, ip, tld, ttl, wait).await;
         });
     }
 
     // Ensure http://dig.local reaches the local dig-node too (SPEC §12) — independent of, and
     // non-fatal relative to, the .dig gateway/DNS paths above.
-    spawn_dig_local_ensure(config.clone());
+    spawn_dig_local_ensure(config.clone(), shutdown_tx.subscribe());
 
-    serve_on(listener, client, ctx, async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
+    serve_on(
+        listener,
+        client,
+        ctx,
+        wait_for_shutdown(shutdown_tx.subscribe()),
+    )
     .await;
     Ok(())
+}
+
+/// A future that resolves once the shared shutdown [`tokio::sync::watch`] flag flips to `true`
+/// (or the sender is dropped). `wait_for` also returns immediately when the flag is ALREADY
+/// `true`, so a subtask spawned just after the trigger still shuts down.
+async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
+    let _ = rx.wait_for(|flagged| *flagged).await;
 }
 
 /// Probe-then-bind-if-absent (SPEC §12.1 steps 1–2): the idempotency check + bind, isolated
@@ -397,22 +436,22 @@ pub async fn ensure_dig_local_mapping(
     outcome
 }
 
-/// Spawn [`ensure_dig_local_mapping`] fire-and-forget from [`run_service`], retrying on
+/// Spawn [`ensure_dig_local_mapping`] fire-and-forget from [`serve_with_shutdown`], retrying on
 /// [`DIG_LOCAL_RETRY_INTERVAL`] only when it reports `Unavailable` (a transient bind failure —
 /// the loopback alias not up yet, or a stale holder that exits shortly) — self-healing without
 /// restarting `dig-dns`. `AlreadyMapped` and `Established` need no retry: the former is already
-/// satisfied, the latter has already served until Ctrl-C by the time it returns.
-fn spawn_dig_local_ensure(config: Config) {
+/// satisfied, the latter has already served until `shutdown` by the time it returns. Shares the
+/// service-wide shutdown watch (`shutdown_rx`), so a service stop ends both the ensure loop and
+/// any established reverse-proxy it is serving.
+fn spawn_dig_local_ensure(config: Config, shutdown_rx: tokio::sync::watch::Receiver<bool>) {
     tokio::spawn(async move {
         loop {
-            let outcome = ensure_dig_local_mapping(&config, async {
-                let _ = tokio::signal::ctrl_c().await;
-            })
-            .await;
+            let outcome =
+                ensure_dig_local_mapping(&config, wait_for_shutdown(shutdown_rx.clone())).await;
             match outcome {
                 EnsureOutcome::Unavailable { .. } => {
                     tokio::select! {
-                        _ = tokio::signal::ctrl_c() => return,
+                        _ = wait_for_shutdown(shutdown_rx.clone()) => return,
                         _ = tokio::time::sleep(DIG_LOCAL_RETRY_INTERVAL) => {}
                     }
                 }

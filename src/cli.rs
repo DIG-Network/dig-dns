@@ -55,6 +55,47 @@ pub enum Command {
         #[arg(long, value_name = "URL")]
         node: Option<String>,
     },
+    /// Internal: the Windows-service entrypoint (speaks the SCM service protocol). Installed by
+    /// `install` on Windows; not meant to be run by hand. On non-Windows it behaves like `serve`.
+    #[command(hide = true)]
+    RunService,
+    /// Register `dig-dns` as an auto-starting OS service (id `net.dignetwork.dig-dns`, display
+    /// "DIG NETWORK: DNS"). If the service already exists it is cleanly recreated
+    /// (stop → delete → recreate), never reconfigured in place — so a re-run never hits
+    /// `CreateService 1073`. Windows requires an elevated (Administrator) console.
+    Install {
+        /// Explicit dig-node endpoint baked into the service (else it resolves the §5.3 ladder).
+        #[arg(long, value_name = "URL")]
+        node: Option<String>,
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove the `dig-dns` OS service (stops it first). Windows requires elevation.
+    Uninstall {
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start the installed `dig-dns` service.
+    Start {
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop the running `dig-dns` service.
+    Stop {
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report whether the resolver is serving (probes the gateway) + whether it is registered.
+    /// Exits non-zero when nothing is serving.
+    Status {
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Resolve a single `.dig` resource through the gateway pipeline and print it. Accepts a
     /// bare host (`<label>.dig`), a `host/path`, or a full `http://<label>.dig/path` URL.
     Fetch {
@@ -170,13 +211,19 @@ where
                 ))
             }
         }
-        // `serve`/`fetch`/`doctor`/`pac` are async and run directly in `run()`; `execute` is
-        // the pure path.
+        // `serve`/`fetch`/`doctor`/`pac` (async) and the service commands (touch the OS service
+        // manager) run directly in `run()`; `execute` is the pure path.
         Command::Serve { .. }
         | Command::Fetch { .. }
         | Command::Doctor { .. }
-        | Command::Pac { .. } => {
-            Err("serve/fetch/doctor/pac run via the binary entrypoint, not execute()".to_string())
+        | Command::Pac { .. }
+        | Command::RunService
+        | Command::Install { .. }
+        | Command::Uninstall { .. }
+        | Command::Start { .. }
+        | Command::Stop { .. }
+        | Command::Status { .. } => {
+            Err("this command runs via the binary entrypoint, not execute()".to_string())
         }
     }
 }
@@ -307,6 +354,73 @@ pub fn run() -> std::process::ExitCode {
             }
             ExitCode::SUCCESS
         }
+        // The Windows-service entrypoint: hand control to the SCM dispatcher. Off Windows there
+        // is no SCM, so behave like `serve` (systemd/launchd exec the foreground process).
+        Command::RunService => {
+            init_tracing();
+            #[cfg(windows)]
+            {
+                match crate::win_service::run() {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => fail(&e.to_string()),
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let cfg = match load_config(None) {
+                    Ok(c) => c,
+                    Err(e) => return fail(&e),
+                };
+                let rt = match runtime() {
+                    Ok(rt) => rt,
+                    Err(e) => return fail(&e.to_string()),
+                };
+                match rt.block_on(crate::server::run_service(cfg)) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => fail(&e.to_string()),
+                }
+            }
+        }
+        Command::Install { node, json } => {
+            let cfg = match load_config(node.as_deref()) {
+                Ok(c) => c,
+                Err(e) => return fail(&e),
+            };
+            match crate::service::install(&cfg) {
+                Ok(out) => print_service_outcome(&out, *json),
+                Err(e) => fail(&e.to_string()),
+            }
+        }
+        Command::Uninstall { json } => match crate::service::uninstall() {
+            Ok(out) => print_service_outcome(&out, *json),
+            Err(e) => fail(&e.to_string()),
+        },
+        Command::Start { json } => match crate::service::start() {
+            Ok(out) => print_service_outcome(&out, *json),
+            Err(e) => fail(&e.to_string()),
+        },
+        Command::Stop { json } => match crate::service::stop() {
+            Ok(out) => print_service_outcome(&out, *json),
+            Err(e) => fail(&e.to_string()),
+        },
+        Command::Status { json } => {
+            let cfg = match load_config(None) {
+                Ok(c) => c,
+                Err(e) => return fail(&e),
+            };
+            match crate::service::status(&cfg) {
+                Ok(out) => {
+                    let serving = out.json["serving"].as_bool().unwrap_or(false);
+                    print_service_outcome(&out, *json);
+                    if serving {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    }
+                }
+                Err(e) => fail(&e.to_string()),
+            }
+        }
         _ => match execute(&cli, |k| std::env::var(k).ok()) {
             Ok(out) => {
                 println!("{out}");
@@ -315,6 +429,21 @@ pub fn run() -> std::process::ExitCode {
             Err(msg) => fail(&msg),
         },
     }
+}
+
+/// Print a [`crate::service::ServiceOutcome`]: the JSON object in `--json` mode, else the human
+/// summary. Returns `SUCCESS` (the caller overrides the exit code where the outcome implies one,
+/// e.g. `status`).
+fn print_service_outcome(
+    out: &crate::service::ServiceOutcome,
+    json: bool,
+) -> std::process::ExitCode {
+    if json {
+        println!("{}", out.json);
+    } else {
+        println!("{}", out.summary);
+    }
+    std::process::ExitCode::SUCCESS
 }
 
 /// Print an error to stderr and return the failure exit code.
@@ -445,12 +574,22 @@ mod tests {
     }
 
     #[test]
-    fn execute_rejects_async_commands() {
-        // `serve`/`fetch` are dispatched by run(), not execute(); execute reports that.
-        let err = execute(&cli(&["serve"]), no_env).unwrap_err();
-        assert!(err.contains("serve/fetch"), "unexpected: {err}");
-        let err = execute(&cli(&["fetch", "abc.dig"]), no_env).unwrap_err();
-        assert!(err.contains("serve/fetch"), "unexpected: {err}");
+    fn execute_rejects_binary_entrypoint_commands() {
+        // `serve`/`fetch` (async) and the service commands are dispatched by run(), not
+        // execute(); execute reports that rather than silently mishandling them.
+        for args in [
+            vec!["serve"],
+            vec!["fetch", "abc.dig"],
+            vec!["install"],
+            vec!["uninstall"],
+            vec!["status"],
+        ] {
+            let err = execute(&cli(&args), no_env).unwrap_err();
+            assert!(
+                err.contains("runs via the binary entrypoint"),
+                "unexpected for {args:?}: {err}"
+            );
+        }
     }
 
     #[test]
