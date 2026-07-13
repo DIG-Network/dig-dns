@@ -46,11 +46,19 @@ and a `.deb` (`cargo-deb` metadata + `packaging/linux/…service`). Durable gotc
 - **`C:\ProgramData\DigDns` needs no custom ACL:** it inherits ProgramData's ACL (SYSTEM+Admins full,
   Users read) which already IS the "SYSTEM+Administrators full, installing user READ" requirement, so
   no WixToolset.Util `PermissionEx` extension is pulled in (the dir is non-secret anyway).
-- **`.deb` via `cargo-deb` `[package.metadata.deb.systemd-units]`** with `unit-name` +
-  `unit-scripts = "packaging/linux"` auto-generates the enable/start/stop maintainer scripts; the unit
-  itself grants `AmbientCapabilities=CAP_NET_BIND_SERVICE` (the only privilege for `:53`/`:80`) and
-  `StateDirectory=dig-dns` (systemd creates `/var/lib/dig-dns`). The Debian-conventional
-  `dig-dns_<ver>_amd64.deb` name is the apt-correct asset `apt.dig.net` ingests + GPG-signs (#425).
+- **`.deb` via `cargo-deb`: `[package.metadata.deb.systemd-units]` is NOT enough on its own — you
+  MUST also set `maintainer-scripts` (#525).** cargo-deb only GENERATES the enable/start postinst
+  (+ prerm/postrm) when `maintainer-scripts` is present under `[package.metadata.deb]`; with only
+  `[systemd-units]` (`unit-name` + `unit-scripts`) it still installs the unit file but ships NO
+  postinst, so the service is placed yet never enabled or started (`systemctl is-enabled` -> "disabled").
+  Point `maintainer-scripts` at the same `packaging/linux` dir (it holds only the `.service` file, so
+  cargo-deb creates the scripts fresh). Verify with `dpkg-deb -e <deb> out && cat out/postinst` — the
+  postinst MUST contain `deb-systemd-helper enable`. The generated postrm MASKS the unit on `remove`
+  (`/etc/systemd/system/<unit> -> /dev/null`) and only unmasks on `purge`, so a "clean removal" smoke
+  test must `apt-get purge`, not `remove`. The unit grants `AmbientCapabilities=CAP_NET_BIND_SERVICE`
+  (the only privilege for `:53`/`:80`) and `StateDirectory=dig-dns` (systemd creates `/var/lib/dig-dns`).
+  The Debian-conventional `dig-dns_<ver>_amd64.deb` name is the apt-correct asset `apt.dig.net` ingests
+  + GPG-signs (#425).
 - **`.gitattributes` forces LF** on `packaging/**` + `wix/**` + `scripts/*.sh`: a CRLF launchd plist /
   systemd unit / shell maintainer script can be rejected at install time on an autocrlf checkout.
 

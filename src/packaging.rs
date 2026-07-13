@@ -289,4 +289,29 @@ mod tests {
             "unit-scripts dir"
         );
     }
+
+    #[test]
+    fn cargo_deb_generates_the_enable_start_maintainer_scripts() {
+        // Regression for dig_ecosystem #525: cargo-deb only GENERATES the systemd enable/start
+        // postinst (+ prerm/postrm) when `maintainer-scripts` is set under `[package.metadata.deb]`
+        // — EVEN when `[package.metadata.deb.systemd-units]` is present. Without that key cargo-deb
+        // still installs the unit file but ships NO postinst, so the installed `.deb` never enables
+        // or starts the service (`systemctl is-enabled` reports "disabled" and the release smoke
+        // test fails, blocking the whole GitHub Release). Assert the key is present + the units are
+        // configured to enable + start, so a future edit that drops it fails HERE at the `cargo
+        // test` gate rather than silently in the tag-time release pipeline.
+        let cargo = read_normalized("Cargo.toml");
+        assert!(
+            cargo.contains("maintainer-scripts = \"packaging/linux\""),
+            "maintainer-scripts must be set or cargo-deb generates no enable/start postinst (#525)"
+        );
+        assert!(
+            cargo.contains("enable = true"),
+            "unit must be enabled on install"
+        );
+        assert!(
+            cargo.contains("start = true"),
+            "unit must be started on install"
+        );
+    }
 }

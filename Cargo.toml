@@ -10,7 +10,7 @@
 # root and increase on every PR (CLAUDE.md §2.4 / §3.6).
 [package]
 name = "dig-dns"
-version = "0.10.1"
+version = "0.10.2"
 edition = "2021"
 description = "Local *.dig name resolution: a DNS responder + HTTP gateway resolving <storeId>.dig to DIG store content via a dig-node."
 license = "GPL-2.0-only"
@@ -28,6 +28,14 @@ readme = "README.md"
 maintainer = "DIG Network <dev@dig.net>"
 section = "net"
 priority = "optional"
+# REQUIRED for cargo-deb to actually GENERATE the systemd maintainer scripts: cargo-deb only
+# emits the enable/start postinst (+ prerm/postrm) when `maintainer-scripts` is set, EVEN when
+# `[package.metadata.deb.systemd-units]` is present. Without it, cargo-deb still installs the unit
+# file but silently ships NO postinst, so the service is never enabled or started on install
+# (dig_ecosystem #525 — the .deb installed but `systemctl is-enabled` reported "disabled"). The
+# directory holds only the unit file (no hand-written maintainer scripts), so cargo-deb creates
+# the scripts fresh from its autoscript fragments.
+maintainer-scripts = "packaging/linux"
 extended-description = """
 dig-dns is the local *.dig resolver: a DNS responder + HTTP gateway that resolves
 <storeId>.dig hostnames to DIG Network store content fetched from a dig-node. It installs as an
@@ -35,9 +43,10 @@ auto-starting systemd service (net.dignetwork.dig-dns) bound to a loopback IP; i
 and never acts as an open proxy."""
 
 # cargo-deb wires the systemd unit: it installs packaging/linux/net.dignetwork.dig-dns.service to
-# /lib/systemd/system and generates the maintainer scripts (daemon-reload + enable --now on
-# install, stop + disable on removal). The service needs CAP_NET_BIND_SERVICE for :53/:80 (granted
-# in the unit) and a machine-wide state dir /var/lib/dig-dns (created via the unit's StateDirectory).
+# /usr/lib/systemd/system and (given `maintainer-scripts` above) generates the maintainer scripts
+# (daemon-reload + enable + start on install, stop on remove, unmask + purge on purge). The
+# service needs CAP_NET_BIND_SERVICE for :53/:80 (granted in the unit) and a machine-wide state dir
+# /var/lib/dig-dns (created via the unit's StateDirectory).
 [package.metadata.deb.systemd-units]
 unit-name = "net.dignetwork.dig-dns"
 unit-scripts = "packaging/linux"
