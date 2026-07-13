@@ -2,6 +2,36 @@
 
 High-signal, durable realizations (not a change diary). Keep entries concise + verified.
 
+## OS service: identity + clean-reinstall (fixes Windows 1073)
+
+The service is registered under id `net.dignetwork.dig-dns` (SCM name / launchd label / systemd
+unit) with Windows display name "DIG NETWORK: DNS" — matching the sibling `net.dignetwork.dig-node`.
+Two gotchas:
+
+- **`service-manager` 0.7 hardcodes the Windows display name to the service id.** Its `sc create`
+  passes `displayname= <service_name>`; there is no `ServiceInstallCtx` field for a custom display
+  name. To get "DIG NETWORK: DNS" you MUST run `sc.exe config <id> displayname= "DIG NETWORK: DNS"`
+  AFTER `create` (best-effort — a failure leaves the service usable under its id).
+- **Clean-reinstall, not reconfigure-in-place, is what defeats `CreateService 1073`.** On an
+  installer re-run, an existing service must be **stop → delete → wait-for-removal → recreate →
+  start**. A Windows `sc delete` marks the service for deletion but it can LINGER until open
+  handles close, so poll `sc query` for its disappearance (check-before-sleep, bounded) before
+  recreating — otherwise the recreate races the pending delete and still 1073s.
+
+The OS calls sit behind the `service::ServiceBackend` trait so the reinstall ORDER is unit-tested
+against a recording mock whose `create` re-raises 1073 when the service still appears installed —
+CI never registers a real service (`sc create` needs elevation + mutates the machine).
+
+## Windows service needs the SCM dispatcher (else error 1053)
+
+Registering the service (service-manager) is NOT enough: the exe the SCM launches must call
+`StartServiceCtrlDispatcher` and report `Running` within ~30s or the SCM kills it with 1053. So
+`install` registers `dig-dns run-service` (a hidden subcommand) on Windows, which hands off to
+`win_service::run` (the `windows-service` crate dispatcher); systemd/launchd exec `serve`
+directly. `serve_with_shutdown(config, shutdown)` threads ONE shutdown signal (a `tokio::sync::watch`
+flag, not `Notify` — a late-subscribing subtask still observes the trigger) out to the gateway +
+DNS + `dig.local` subtasks, so an SCM `Stop` tears the whole service down gracefully.
+
 ## TLS: rustls + **ring**, never aws-lc-rs
 
 `release.yml` cross-compiles the `x86_64-apple-darwin` binary on an arm64 macOS runner and

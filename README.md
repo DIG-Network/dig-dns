@@ -10,8 +10,11 @@ Reliability-first: **two independent resolution paths** — an OS split-DNS resp
 proxy the browser can be pointed at — plus a `doctor` diagnostic, so a `.dig` URL still loads
 when one path is blocked (e.g. a browser forcing DNS-over-HTTPS).
 
-`SPEC.md` is the normative contract. `dig-dns` is installed as an OS service by
-**dig-installer** (a separate unit of work).
+`SPEC.md` is the normative contract. `dig-dns` registers itself as an OS service via
+`dig-dns install` — service id `net.dignetwork.dig-dns`, Windows display name "DIG NETWORK:
+DNS", with a clean-reinstall (stop → delete → recreate) so a re-run never hits `CreateService
+1073` (SPEC §13). **dig-installer** invokes `dig-dns install` and arranges the OS split-DNS +
+loopback alias + browser PAC policy around it.
 
 ## How a `.dig` URL resolves
 

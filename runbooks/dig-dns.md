@@ -29,6 +29,10 @@ dig-dns config [--json]                     # resolved config
 dig-dns serve [--node <URL>]               # run the gateway + DNS responder (Ctrl-C to stop)
 dig-dns fetch <host|url> [path] [--json]    # one-shot: resolve a .dig resource + print it
 dig-dns doctor [--json]                     # diagnose both paths; nonzero if no path can load
+dig-dns install [--node <URL>] [--json]     # register (clean-reinstall) + start the OS service
+dig-dns uninstall [--json]                  # stop + deregister the OS service
+dig-dns start|stop [--json]                 # start / stop the registered service
+dig-dns status [--json]                     # serving? + registered? (nonzero when not serving)
 ```
 
 **`doctor`** checks each link of both resolution paths independently and prints pass/fail + a
@@ -99,6 +103,39 @@ The PAC CLI + README + per-OS acceptance scripts (Phase 5) land next.
 `dig.local → localhost:9778 → rpc.dig.net` ladder), and `DIG_DNS_LOCAL_IP`/`DIG_DNS_LOCAL_PORT`
 (the ensured `dig.local` reverse-proxy address, default `127.0.0.2:80`, SPEC §12).
 
+## Installing as an OS service
+
+`dig-dns` registers itself as an auto-starting OS service (Windows SCM / Linux systemd / macOS
+launchd) that runs `dig-dns serve`. Identity + contract (normative in `SPEC.md §13`):
+
+- **service id** `net.dignetwork.dig-dns` — the SCM name / launchd label / systemd unit
+  (`net.dignetwork.dig-dns.service`).
+- **Windows display name** `DIG NETWORK: DNS` — shown in the Services console.
+- **clean-reinstall** — if the service already exists, `install` does **stop → delete → wait →
+  recreate → start** (never reconfigure-in-place), so a re-run never hits `CreateService 1073
+  "the specified service already exists"`.
+
+```sh
+# Register + start (bakes the resolved config into the service env). Elevate on Windows.
+sudo dig-dns install                       # Linux/macOS user-level needs no sudo; shown for parity
+dig-dns install --node http://localhost:9778   # pin an explicit upstream node
+dig-dns status                             # is it serving? is it registered?
+dig-dns stop ; dig-dns start               # control it
+dig-dns uninstall                          # stop + deregister
+```
+
+Windows (elevated "Run as administrator" console):
+
+```powershell
+dig-dns install                            # sc create net.dignetwork.dig-dns … + displayname "DIG NETWORK: DNS"
+sc query net.dignetwork.dig-dns            # verify registered/running
+dig-dns install                            # re-run is a CLEAN reinstall — NOT a 1073 error
+```
+
+Install level: user-level (no elevation) on Linux/macOS; system-level (needs Administrator) on
+Windows. The installed Windows service runs the hidden `run-service` entrypoint (the SCM
+protocol dispatcher) so the SCM does not kill it with error 1053.
+
 ## Deployment / release
 
 Tag-driven, per CLAUDE.md §3.6:
@@ -118,5 +155,7 @@ Tag-driven, per CLAUDE.md §3.6:
 fire. **Verify a release:** confirm the `vX.Y.Z` tag exists, the `Release dig-dns` run is
 green, and the GitHub Release has the four binaries attached.
 
-**Consumers:** the dig-installer resolves these release binaries and installs `dig-dns` as an
-OS service (Component B — a separate unit of work in the dig-installer repo).
+**Consumers:** the dig-installer resolves these release binaries and invokes `dig-dns install`
+(which self-registers under `net.dignetwork.dig-dns` / "DIG NETWORK: DNS" and clean-reinstalls,
+so an installer re-run never hits `CreateService 1073`); the installer's remaining job (Component
+B) is OS split-DNS + the loopback alias + browser PAC policy.
