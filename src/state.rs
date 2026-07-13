@@ -130,6 +130,40 @@ pub fn remove_runtime() {
     let _ = std::fs::remove_file(runtime_path());
 }
 
+/// RAII lifetime marker for the runtime-info file: [`RuntimeGuard::record`] best-effort WRITES
+/// [`RUNTIME_FILE`] into the machine-wide state dir, and `Drop` REMOVES it. The serve loop holds
+/// one for its whole lifetime, so the file is present exactly while the service is serving and
+/// is cleared on a graceful stop — the CLI never inherits a stale pid/port from a prior run.
+///
+/// The write is best-effort (a non-admin foreground `dig-dns serve` may be unable to write the
+/// system dir); a failure is logged, not fatal — the service still serves, and the CLI falls
+/// back to probing the loopback port. Dir-parameterised so it is unit-testable against a temp
+/// dir without touching the process environment.
+pub struct RuntimeGuard {
+    dir: PathBuf,
+}
+
+impl RuntimeGuard {
+    /// Record `info` into `dir` (best-effort) and return a guard that removes it on drop.
+    pub fn record(dir: PathBuf, info: &RuntimeInfo) -> Self {
+        if let Err(e) = write_runtime_to(&dir, info) {
+            tracing::warn!(
+                error = %e,
+                dir = %dir.display(),
+                "could not record runtime info to the machine-wide state dir (non-fatal; the \
+                 CLI will fall back to probing the loopback port)"
+            );
+        }
+        Self { dir }
+    }
+}
+
+impl Drop for RuntimeGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.dir.join(RUNTIME_FILE));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,7 +202,10 @@ mod tests {
     #[test]
     #[cfg(all(unix, not(target_os = "macos")))]
     fn linux_default_is_var_lib() {
-        assert_eq!(resolve_state_dir(getter(&[])), PathBuf::from("/var/lib/dig-dns"));
+        assert_eq!(
+            resolve_state_dir(getter(&[])),
+            PathBuf::from("/var/lib/dig-dns")
+        );
     }
 
     #[test]
@@ -202,5 +239,34 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dig-dns-absent-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(read_runtime_from(&dir), None);
+    }
+
+    #[test]
+    fn runtime_guard_records_on_create_and_clears_on_drop() {
+        // The serve loop holds a `RuntimeGuard` for its whole lifetime: the runtime file MUST
+        // exist while serving (so the CLI can find the service) and be gone once the guard drops
+        // (a graceful stop), never leaving a stale pid/port behind for the next CLI to trust.
+        let dir = std::env::temp_dir().join(format!("dig-dns-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let info = RuntimeInfo {
+            pid: std::process::id(),
+            loopback_ip: "127.0.0.5".to_string(),
+            http_port: 80,
+            dns_active: true,
+        };
+        {
+            let _guard = RuntimeGuard::record(dir.clone(), &info);
+            assert_eq!(
+                read_runtime_from(&dir).as_ref(),
+                Some(&info),
+                "runtime file must be present while the guard is alive"
+            );
+        }
+        assert_eq!(
+            read_runtime_from(&dir),
+            None,
+            "dropping the guard must remove the runtime file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

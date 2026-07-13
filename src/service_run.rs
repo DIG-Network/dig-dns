@@ -90,7 +90,9 @@ mod tests {
             Ok(())
         }
         fn report_stopped(&self, exit_code: u32) {
-            self.events.borrow_mut().push(format!("stopped:{exit_code}"));
+            self.events
+                .borrow_mut()
+                .push(format!("stopped:{exit_code}"));
             *self.stopped_exit.borrow_mut() = Some(exit_code);
         }
     }
@@ -134,7 +136,10 @@ mod tests {
             Ok(())
         });
         assert!(out.is_err());
-        assert!(!*ran.borrow(), "body must not run when RUNNING cannot be reported");
+        assert!(
+            !*ran.borrow(),
+            "body must not run when RUNNING cannot be reported"
+        );
         assert!(reporter.events().is_empty());
         assert_eq!(*reporter.stopped_exit.borrow(), None);
     }

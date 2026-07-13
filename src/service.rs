@@ -524,29 +524,55 @@ pub fn stop() -> io::Result<ServiceOutcome> {
 /// meaningful "is it up?" check — `service-manager` exposes no status query), and best-effort
 /// whether it is registered. The `serving` boolean is the answer the caller maps to an exit
 /// code; `registered` is informational.
+///
+/// **#501 — the CLI targets the RUNNING service regardless of who invokes it.** The gateway
+/// probe already hits the shared loopback port (user-independent), and this additionally reads
+/// the machine-wide runtime file the service records on startup ([`crate::state`]:
+/// `%PROGRAMDATA%\DigDns` / `/var/lib/dig-dns` / `/Library/Application Support/DigDns`,
+/// `DIG_DNS_STATE_DIR` override) to surface the exact service `pid` and the ACTUALLY-bound port
+/// (which may be the `:8053` fallback) — the same values whichever user runs `dig-dns status`,
+/// since the state dir is identity-independent, never a per-user profile dir.
 pub fn status(config: &Config) -> io::Result<ServiceOutcome> {
     let serving = probe_serving(config);
     let registered = SystemServiceBackend::new()
         .and_then(|b| b.is_installed())
         .unwrap_or(false);
+    let runtime = crate::state::read_runtime();
     let primary = format!("{}:{}", config.loopback_ip, config.http_port);
+
+    // The runtime file records the port the service actually bound; prefer it in the reported
+    // address (it may be the fallback), falling back to the configured primary when absent.
+    let bound = runtime
+        .as_ref()
+        .map(|r| format!("{}:{}", r.loopback_ip, r.http_port))
+        .unwrap_or_else(|| primary.clone());
+    let pid_note = runtime
+        .as_ref()
+        .map(|r| format!(", pid {}", r.pid))
+        .unwrap_or_default();
     let summary = if serving {
-        format!("dig-dns: SERVING on http://{primary} (registered: {registered})")
+        format!("dig-dns: SERVING on http://{bound} (registered: {registered}{pid_note})")
     } else {
         format!(
-            "dig-dns: NOT responding on http://{primary} (registered: {registered}) — the \
-             service may be stopped or not installed"
+            "dig-dns: NOT responding on http://{bound} (registered: {registered}{pid_note}) — \
+             the service may be stopped or not installed"
         )
     };
-    Ok(ServiceOutcome {
-        summary,
-        json: json!({
-            "serving": serving,
-            "registered": registered,
-            "label": SERVICE_LABEL,
-            "addr": primary,
-        }),
-    })
+    let mut obj = json!({
+        "serving": serving,
+        "registered": registered,
+        "label": SERVICE_LABEL,
+        "addr": bound,
+        "state_dir": crate::state::state_dir().display().to_string(),
+    });
+    // Surface the recorded runtime facts (pid, bound port, DNS-path active) when present, so a
+    // scripted client can identify the exact process regardless of the invoking user (#501).
+    if let Some(r) = runtime {
+        obj["pid"] = json!(r.pid);
+        obj["bound_port"] = json!(r.http_port);
+        obj["dns_active"] = json!(r.dns_active);
+    }
+    Ok(ServiceOutcome { summary, json: obj })
 }
 
 /// Blocking gateway probe over loopback: try the primary HTTP port then the `:8053` fallback,

@@ -279,6 +279,21 @@ pub async fn serve_with_shutdown(
         );
     }
 
+    // Record the machine-wide runtime info (pid + the ACTUALLY-bound port, which may be the
+    // `:8053` fallback) so the CLI can locate + identify THIS service process regardless of the
+    // invoking user (#501). The guard is held for the whole serve lifetime and removes the file
+    // on shutdown, so the CLI never inherits a stale pid/port. Best-effort — a non-admin
+    // foreground `serve` may be unable to write the system dir (logged, non-fatal).
+    let _runtime_guard = crate::state::RuntimeGuard::record(
+        crate::state::state_dir(),
+        &crate::state::RuntimeInfo {
+            pid: std::process::id(),
+            loopback_ip: config.loopback_ip.to_string(),
+            http_port: bound_port,
+            dns_active,
+        },
+    );
+
     let ctx = Ctx {
         config: config.clone(),
         bound_port,
@@ -719,6 +734,33 @@ mod tests {
             .unwrap();
         assert!(used_fallback);
         assert_ne!(port, primary.port());
+    }
+
+    #[tokio::test]
+    async fn bind_listener_errors_fast_when_both_primary_and_fallback_are_held() {
+        // The 1053 fix requires bind failure to be a FAST, diagnosable error — never a hang.
+        // Occupy BOTH the primary and the fallback, then assert `bind_listener` returns an error
+        // naming both addresses (so a service can report STOPPED + a clear cause) rather than
+        // blocking. The whole assertion is wrapped in a short timeout to prove non-blocking.
+        let held_primary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let held_fallback = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary = held_primary.local_addr().unwrap();
+        let fallback = held_fallback.local_addr().unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), bind_listener(primary, fallback))
+            .await
+            .expect("bind_listener must return promptly, never hang");
+
+        let err = result.expect_err("both addresses held ⇒ a hard bind error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&primary.to_string()),
+            "error names the primary: {msg}"
+        );
+        assert!(
+            msg.contains(&fallback.to_string()),
+            "error names the fallback: {msg}"
+        );
     }
 
     #[tokio::test]
