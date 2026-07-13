@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.10.0] - 2026-07-13
+
+### Features
+- Native OS install packages (.msi/.pkg/.deb) self-installing the service (#503) (#13)
+
 ## [0.9.1] - 2026-07-13
 
 ### Testing
