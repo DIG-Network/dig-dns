@@ -1,0 +1,26 @@
+#!/bin/sh
+# dig-dns .deb POSTINST (dig_ecosystem #530).
+#
+# The debhelper token below is replaced by cargo-deb with its systemd snippets (daemon-reload +
+# enable + start the net.dignetwork.dig-dns unit). After that, wire OS-level *.dig resolution so a
+# bare "apt install dig-dns" makes *.dig resolve SYSTEM-WIDE, not merely start the service:
+# "dig-dns configure-os" writes the systemd-resolved / NetworkManager-dnsmasq split-DNS drop-in
+# routing ~dig at 127.0.0.5 (SPEC section 15).
+#
+# Default ON. Opt out by setting DIG_DNS_SKIP_CONFIGURE_OS=1 in the install environment, e.g.
+#   sudo DIG_DNS_SKIP_CONFIGURE_OS=1 apt install ./dig-dns_*.deb
+# Best-effort (|| true): a resolver-wiring hiccup must never fail the package install (the service
+# still runs; Path B / the PAC still resolves *.dig in the browser).
+#
+# NOTE: the debhelper token must appear exactly once, on its own line below. Do NOT write it in
+# prose anywhere else -- cargo-deb substitutes every occurrence, which would splice the systemd
+# snippet into a comment and corrupt this script.
+set -e
+
+#DEBHELPER#
+
+if [ "${DIG_DNS_SKIP_CONFIGURE_OS:-0}" != "1" ]; then
+    dig-dns configure-os || true
+fi
+
+exit 0

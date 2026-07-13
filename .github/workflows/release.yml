@@ -214,6 +214,15 @@ jobs:
           done
           systemctl status net.dignetwork.dig-dns --no-pager || true
           journalctl -u net.dignetwork.dig-dns --no-pager -n 30 || true
+          # #530: the postinst runs `dig-dns configure-os`. On this systemd-resolved runner it wires
+          # /etc/systemd/resolved.conf.d/dig.conf; record whether it did so we can assert prerm/purge
+          # removes it (zero residue). Conditional so a differently-configured runner never flakes.
+          DROPIN=/etc/systemd/resolved.conf.d/dig.conf
+          if [ -f "$DROPIN" ]; then
+            echo "postinst configure-os wired systemd-resolved ($DROPIN)"; WIRED=1
+          else
+            echo "(no systemd-resolved drop-in — resolver owner may differ on this runner; informational)"; WIRED=0
+          fi
           # BLOCKING: PURGE stops + fully deregisters the unit, leaving nothing behind. `remove`
           # alone MASKS the unit (postrm creates /etc/systemd/system/<unit> -> /dev/null, standard
           # Debian behaviour) so `systemctl cat` would still succeed on the mask; `purge` runs the
@@ -221,7 +230,12 @@ jobs:
           # is genuinely gone — the true "clean removal" assertion (matches the .pkg leg's intent).
           sudo apt-get purge -y dig-dns
           if systemctl cat net.dignetwork.dig-dns.service 2>/dev/null; then echo "unit still present after purge"; exit 1; fi
-          echo ".deb smoke test PASSED: unit installed (ExecStart+CAP_NET_BIND_SERVICE), enabled, purged cleanly."
+          # #530: prerm ran `dig-dns unconfigure-os` before the binary was removed — the configure-os
+          # drop-in must be gone (zero residue).
+          if [ "$WIRED" = 1 ] && [ -e "$DROPIN" ]; then
+            echo "configure-os drop-in left behind after purge (prerm unconfigure-os failed) (#530)"; exit 1
+          fi
+          echo ".deb smoke test PASSED: unit installed (ExecStart+CAP_NET_BIND_SERVICE), enabled, configure-os wired + reversed, purged cleanly."
 
       # ---------------------------------------------------------------------------------------
       # macOS: build the .pkg (pkgbuild/productbuild) then smoke-test install → verify daemon →
@@ -234,11 +248,15 @@ jobs:
           set -eo pipefail
           PAYLOAD="pkgroot"
           rm -rf "$PAYLOAD"
-          mkdir -p "$PAYLOAD/usr/local/bin" "$PAYLOAD/Library/LaunchDaemons"
+          mkdir -p "$PAYLOAD/usr/local/bin" "$PAYLOAD/Library/LaunchDaemons" "$PAYLOAD/usr/local/share/dig-dns"
           cp "target/${{ matrix.target }}/release/dig-dns" "$PAYLOAD/usr/local/bin/dig-dns"
           chmod 755 "$PAYLOAD/usr/local/bin/dig-dns"
           cp packaging/macos/net.dignetwork.dig-dns.plist "$PAYLOAD/Library/LaunchDaemons/"
           chmod 644 "$PAYLOAD/Library/LaunchDaemons/net.dignetwork.dig-dns.plist"
+          # Ship the uninstaller (a .pkg has no built-in one) — reverses configure-os + removes the
+          # payload (dig_ecosystem #530).
+          cp packaging/macos/uninstall.sh "$PAYLOAD/usr/local/share/dig-dns/uninstall.sh"
+          chmod 755 "$PAYLOAD/usr/local/share/dig-dns/uninstall.sh"
           chmod 755 packaging/macos/scripts/preinstall packaging/macos/scripts/postinstall
           pkgbuild --root "$PAYLOAD" \
                    --identifier net.dignetwork.dig-dns \
@@ -257,18 +275,21 @@ jobs:
           PKG=$(ls dist/*.pkg)
           echo "Installing $PKG"
           sudo installer -pkg "$PKG" -target / -verbose
-          # BLOCKING: the payload + plist are installed.
+          # BLOCKING: the payload + plist + uninstaller are installed.
           test -x /usr/local/bin/dig-dns                                        || { echo "binary not installed"; exit 1; }
           test -f /Library/LaunchDaemons/net.dignetwork.dig-dns.plist           || { echo "plist not installed"; exit 1; }
           test -d "/Library/Application Support/DigDns"                         || { echo "state dir not created"; exit 1; }
-          # INFORMATIVE: whether launchd bootstrapped/started it — logged, not release-blocking.
+          test -x /usr/local/share/dig-dns/uninstall.sh                         || { echo "uninstaller not installed (#530)"; exit 1; }
+          # INFORMATIVE: whether launchd bootstrapped/started it, and whether postinstall's
+          # configure-os wired /etc/resolver/dig + the lo0 alias (#530) — logged, not blocking.
           sudo launchctl print system/net.dignetwork.dig-dns || echo "(daemon not printable — informational)"
-          # BLOCKING: uninstall (bootout + payload removal) leaves nothing behind.
-          sudo launchctl bootout system/net.dignetwork.dig-dns 2>/dev/null || true
-          sudo rm -f /Library/LaunchDaemons/net.dignetwork.dig-dns.plist /usr/local/bin/dig-dns
-          sudo rm -rf "/Library/Application Support/DigDns"
-          if sudo launchctl print system/net.dignetwork.dig-dns 2>/dev/null; then echo "daemon still present after bootout"; exit 1; fi
-          echo ".pkg smoke test PASSED: binary+plist+state dir installed, daemon removed cleanly."
+          test -f /etc/resolver/dig && echo "configure-os wrote /etc/resolver/dig" || echo "(no /etc/resolver/dig — informational)"
+          ifconfig lo0 | grep -q 127.0.0.5 && echo "configure-os aliased 127.0.0.5 on lo0" || echo "(no lo0 alias — informational)"
+          # BLOCKING: the shipped uninstaller reverses configure-os + removes the payload cleanly.
+          sudo /usr/local/share/dig-dns/uninstall.sh
+          if sudo launchctl print system/net.dignetwork.dig-dns 2>/dev/null; then echo "daemon still present after uninstall"; exit 1; fi
+          test -e /etc/resolver/dig && { echo "/etc/resolver/dig left behind after uninstall (#530)"; exit 1; } || true
+          echo ".pkg smoke test PASSED: binary+plist+uninstaller installed, configure-os wired, uninstalled cleanly."
 
       - name: Upload build artifacts (binary + native package)
         uses: actions/upload-artifact@v4

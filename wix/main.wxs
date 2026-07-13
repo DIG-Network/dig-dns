@@ -16,6 +16,12 @@
   Adds the install dir to the system PATH. A fixed UpgradeCode + MajorUpgrade gives clean in-place
   upgrade and uninstall.
 
+  Wires OS-level *.dig resolution (dig_ecosystem #530): deferred custom actions run
+  `dig-dns.exe configure-os` on install and `unconfigure-os` on uninstall (as LocalSystem, so the
+  NRPT rule can be added), gated on the public property CONFIGURE_OS (default 1; silent-install
+  opt-out `msiexec /i … CONFIGURE_OS=0`). They do NOT pass --browser-policy, so the MSI never puts
+  a browser under managed policy.
+
   CI builds it with the Cargo version + the dir holding the freshly-built exe:
     wix build wix/main.wxs -arch x64 -d Version=<cargo version> -d BinDir=<dir with dig-dns.exe> -o <out.msi>
 -->
@@ -96,5 +102,27 @@
       <ComponentGroupRef Id="ProductComponents" />
       <ComponentRef Id="DigDnsDataFolder" />
     </Feature>
+
+    <!-- OS-level *.dig resolution (dig_ecosystem #530). Public property (default ON); opt out of a
+         silent install with `CONFIGURE_OS=0`. -->
+    <Property Id="CONFIGURE_OS" Value="1" />
+
+    <!-- Deferred + non-impersonated → run as LocalSystem (elevated), needed to add/remove the NRPT
+         rule. Return="ignore" so a resolver-wiring hiccup never fails the (un)install. -->
+    <CustomAction Id="DigDnsConfigureOs" FileRef="DigDnsExe" ExeCommand="configure-os"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="DigDnsUnconfigureOs" FileRef="DigDnsExe" ExeCommand="unconfigure-os"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <!-- Configure after the service is started on a fresh install/upgrade-install (the exe is
+           already on disk by StartServices). -->
+      <Custom Action="DigDnsConfigureOs" After="StartServices"
+              Condition="NOT Installed AND CONFIGURE_OS=&quot;1&quot;" />
+      <!-- Unconfigure before the files are removed on a genuine uninstall (NOT during a
+           major-upgrade removal, where the incoming install reconfigures). -->
+      <Custom Action="DigDnsUnconfigureOs" Before="RemoveFiles"
+              Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
   </Package>
 </Wix>

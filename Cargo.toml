@@ -10,7 +10,7 @@
 # root and increase on every PR (CLAUDE.md §2.4 / §3.6).
 [package]
 name = "dig-dns"
-version = "0.10.2"
+version = "0.11.0"
 edition = "2021"
 description = "Local *.dig name resolution: a DNS responder + HTTP gateway resolving <storeId>.dig to DIG store content via a dig-node."
 license = "GPL-2.0-only"
@@ -28,13 +28,15 @@ readme = "README.md"
 maintainer = "DIG Network <dev@dig.net>"
 section = "net"
 priority = "optional"
-# REQUIRED for cargo-deb to actually GENERATE the systemd maintainer scripts: cargo-deb only
-# emits the enable/start postinst (+ prerm/postrm) when `maintainer-scripts` is set, EVEN when
+# REQUIRED for cargo-deb to wire the systemd maintainer scripts: cargo-deb only emits the
+# enable/start postinst (+ prerm/postrm) when `maintainer-scripts` is set, EVEN when
 # `[package.metadata.deb.systemd-units]` is present. Without it, cargo-deb still installs the unit
 # file but silently ships NO postinst, so the service is never enabled or started on install
 # (dig_ecosystem #525 — the .deb installed but `systemctl is-enabled` reported "disabled"). The
-# directory holds only the unit file (no hand-written maintainer scripts), so cargo-deb creates
-# the scripts fresh from its autoscript fragments.
+# directory holds the unit file PLUS hand-written maintainer scripts (postinst/prerm/postrm, each
+# carrying the `#DEBHELPER#` token cargo-deb substitutes with its systemd enable/start/stop/purge
+# fragments) that additionally call `dig-dns configure-os` / `unconfigure-os` to wire OS-level
+# *.dig resolution at install + reverse it on removal (dig_ecosystem #530).
 maintainer-scripts = "packaging/linux"
 extended-description = """
 dig-dns is the local *.dig resolver: a DNS responder + HTTP gateway that resolves

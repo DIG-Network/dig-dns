@@ -24,4 +24,12 @@ chmod 644 "$PLIST"
 /bin/launchctl bootstrap system "$PLIST" || true
 /bin/launchctl enable system/net.dignetwork.dig-dns || true
 
+# Wire OS-level *.dig resolution so the package alone makes *.dig resolve system-wide (#530):
+# the boot-persistent 127.0.0.5 lo0 alias (a FUNCTIONAL PREREQUISITE — macOS answers only
+# 127.0.0.1 on lo0 without it), /etc/resolver/dig, and a DNS-cache flush (SPEC §15). Unconditional
+# on macOS (a .pkg has no opt-out prompt), best-effort (|| true) so a resolver hiccup never fails
+# the install; reverse it with /usr/local/share/dig-dns/uninstall.sh. It does NOT set a managed
+# browser policy (that is the --browser-policy opt-in, which the package never passes).
+/usr/local/bin/dig-dns configure-os || true
+
 exit 0

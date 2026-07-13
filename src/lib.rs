@@ -36,6 +36,9 @@
 //! - [`packaging`] — the native OS install-package contract (#503): the single source of the
 //!   systemd unit + launchd plist the `.deb`/`.pkg` ship, plus the packaging invariants (service
 //!   id, entrypoint, state dir) the committed manifests are tested against.
+//! - [`os_config`] — the `configure-os`/`unconfigure-os` OS resolver wiring (SPEC §15): per-OS
+//!   split-DNS (systemd-resolved/NM-dnsmasq · `/etc/resolver/<tld>` + boot-persistent `lo0`
+//!   alias · NRPT), marker-scoped + legacy-installer-aware, behind pure content/argv builders.
 //! - [`pac`] — Proxy Auto-Config generation for Path B (the PAC control endpoint + CLI).
 //! - [`config`] — service configuration: loopback IP / ports / TLD / node endpoint,
 //!   with flag → env → file override precedence.
@@ -65,6 +68,7 @@ pub mod gateway;
 pub mod host;
 pub mod label;
 pub mod node;
+pub mod os_config;
 pub mod pac;
 pub mod packaging;
 pub mod server;

@@ -1,0 +1,14 @@
+#!/bin/sh
+# dig-dns .deb POSTRM (dig_ecosystem #530).
+#
+# The OS resolver wiring is reversed in prerm (while /usr/bin/dig-dns still exists -- see prerm);
+# postrm only carries cargo-deb's systemd purge/unmask snippets (the debhelper token below), so it
+# is provided explicitly to keep the systemd cleanup deterministic alongside the custom
+# prerm/postinst.
+#
+# NOTE: the debhelper token must appear exactly once, on its own line below (see postinst).
+set -e
+
+#DEBHELPER#
+
+exit 0

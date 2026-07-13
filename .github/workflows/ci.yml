@@ -210,3 +210,116 @@ jobs:
           grep -q '"installed":false' uninstall.json
           "$BIN" status --json | tee status-final.json || true
           grep -q '"registered":false' status-final.json
+
+  # ---------------------------------------------------------------------------------------
+  # configure-os end-to-end (dig_ecosystem #530) — the ONE leg where a real OS resolver is
+  # live: GitHub's ubuntu-latest uses systemd-resolved, so we can prove that `configure-os`
+  # actually flips Path A to live (the OS resolves a *.dig name to the responder) and that
+  # `unconfigure-os` leaves ZERO residue. The per-OS APPLY layer is otherwise only reachable
+  # via the pure builder unit tests + macOS/Windows package smokes in release.yml; this is the
+  # Linux end-to-end acceptance evidence the pure tests can't give.
+  # ---------------------------------------------------------------------------------------
+  configure-os-smoke:
+    name: configure-os end-to-end (systemd-resolved)
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: configure-os-smoke
+      - name: Build the release binary
+        run: cargo build --release --locked --bin dig-dns
+
+      # The whole sequence runs in ONE step so the backgrounded `serve` (root, to bind
+      # 127.0.0.5:53 for the DNS responder — the Path A leg) persists across it.
+      - name: configure-os flips Path A live, unconfigure-os leaves zero residue
+        run: |
+          set -eo pipefail
+          BIN="$PWD/target/release/dig-dns"
+          DROPIN=/etc/systemd/resolved.conf.d/dig.conf
+
+          # Responder as root: binds 127.0.0.5:53 (DNS) + :80→:8053 (gateway). Linux has 127/8 up.
+          sudo -b "$BIN" serve
+          sleep 2
+
+          # Wire systemd-resolved to route ~dig at the responder.
+          sudo "$BIN" configure-os --json | tee configure.json
+          grep -q '"resolver":"systemd-resolved"' configure.json
+          test -f "$DROPIN"
+          grep -qF 'managed by dig-dns configure-os' "$DROPIN"
+
+          # Path A must now be live end-to-end (the OS resolves *.dig -> 127.0.0.5).
+          ok=0
+          for i in $(seq 1 25); do
+            "$BIN" doctor --json > doctor.json || true
+            if grep -q '"path_a":true' doctor.json; then ok=1; echo "Path A live after ${i}s"; break; fi
+            sleep 1
+          done
+          [ "$ok" = 1 ] || { echo "::error::configure-os did not make Path A live"; cat doctor.json; exit 1; }
+
+          # unconfigure-os removes the drop-in (marker-scoped) — ZERO residue.
+          sudo "$BIN" unconfigure-os --json | tee unconfigure.json
+          grep -q 'resolved.conf.d/dig.conf' unconfigure.json
+          test ! -e "$DROPIN"
+
+          sudo pkill -f "$BIN serve" 2>/dev/null || true
+          echo "configure-os end-to-end PASSED: Path A flipped live, then removed with zero residue."
+
+  # ---------------------------------------------------------------------------------------
+  # .deb package-hook smoke (dig_ecosystem #530 + #525) — build the real .deb and prove that
+  # (a) its postinst STILL enables+starts the unit despite the now-custom maintainer scripts
+  # (the #525 guarantee — the custom postinst keeps `#DEBHELPER#`), and (b) the postinst's
+  # `configure-os` wires the resolver + `apt remove`'s prerm `unconfigure-os` leaves ZERO
+  # residue. Runs on the ubuntu-latest runner VM (has systemd, unlike a container). Mirrors
+  # release.yml's .deb leg so a hook regression is caught at PR time, not at release.
+  # ---------------------------------------------------------------------------------------
+  deb-hooks-smoke:
+    name: .deb install/configure-os/remove smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: deb-hooks-smoke
+      - name: Build the release binary + .deb
+        run: |
+          cargo build --release --locked --bin dig-dns
+          cargo install cargo-deb --locked
+          cargo deb --no-build
+      - name: Install the .deb, assert enable/start + configure-os, then remove with zero residue
+        run: |
+          set -eo pipefail
+          DEB=$(ls target/debian/*.deb)
+          DROPIN=/etc/systemd/resolved.conf.d/dig.conf
+          echo "Installing $DEB"
+          sudo apt-get update -qq || true
+          sudo apt-get install -y "./$DEB"
+
+          # #525: the custom postinst (which keeps #DEBHELPER#) MUST still enable the unit.
+          systemctl is-enabled net.dignetwork.dig-dns || { echo "::error::unit not enabled (#525 regression)"; exit 1; }
+
+          # #530: the postinst's configure-os wires systemd-resolved on this runner.
+          if [ -f "$DROPIN" ]; then
+            grep -qF 'managed by dig-dns configure-os' "$DROPIN" || { echo "::error::drop-in not marker-tagged"; exit 1; }
+            echo "postinst configure-os wired $DROPIN"; WIRED=1
+          else
+            echo "(no drop-in — resolver owner may differ on this runner; informational)"; WIRED=0
+          fi
+          # INFORMATIVE: whether *.dig actually resolves (service :53 bind timing can vary).
+          for i in $(seq 1 10); do
+            if resolvectl query test.dig 2>/dev/null | grep -q 127.0.0.5; then echo "*.dig resolves to 127.0.0.5"; break; fi
+            sleep 1
+          done
+
+          # #530: apt remove → prerm unconfigure-os removes the drop-in BEFORE the binary is gone.
+          sudo apt-get remove -y dig-dns
+          if [ "$WIRED" = 1 ] && [ -e "$DROPIN" ]; then
+            echo "::error::drop-in left behind after remove (prerm unconfigure-os failed) (#530)"; exit 1
+          fi
+          echo ".deb hook smoke PASSED: enabled+started (#525), configure-os wired + reversed (#530)."

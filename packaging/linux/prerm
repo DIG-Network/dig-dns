@@ -1,0 +1,22 @@
+#!/bin/sh
+# dig-dns .deb PRERM (dig_ecosystem #530).
+#
+# On REMOVAL (arg "remove") -- NOT "upgrade", where the incoming version reconfigures -- reverse
+# the OS-level *.dig resolver wiring. This MUST run in prerm, not postrm: postrm runs AFTER dpkg
+# has already deleted /usr/bin/dig-dns, so the binary would be gone. Best-effort (|| true). The
+# debhelper token below is then replaced by cargo-deb with its systemd stop/disable snippets.
+#
+# NOTE: the debhelper token must appear exactly once, on its own line below (see postinst).
+set -e
+
+case "$1" in
+    remove)
+        if command -v dig-dns >/dev/null 2>&1; then
+            dig-dns unconfigure-os || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

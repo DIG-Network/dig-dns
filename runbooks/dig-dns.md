@@ -138,47 +138,101 @@ Install level: user-level (no elevation) on Linux/macOS; system-level (needs Adm
 Windows. The installed Windows service runs the hidden `run-service` entrypoint (the SCM
 protocol dispatcher) so the SCM does not kill it with error 1053.
 
+## Configuring OS-level `*.dig` resolution (`configure-os` / `unconfigure-os`)
+
+Installing/starting the service makes `dig-dns` *listen*, but the OS still needs to be told to
+ROUTE `*.dig` names to it. That wiring is a SEPARATE, explicit, **elevated** admin action —
+`dig-dns configure-os` — distinct from the serve runtime (which never edits the resolver). The
+native packages run it for you at install (below); run it by hand for a raw-binary install. Full
+contract: `SPEC.md §15`.
+
+```sh
+# Wire *.dig to resolve system-wide (needs root / Administrator). Idempotent.
+sudo dig-dns configure-os
+sudo dig-dns configure-os --json        # machine-readable (applied paths, resolver, needs_elevation)
+
+# Reverse it (removes ONLY what configure-os / the legacy dig-installer wrote — never an org rule):
+sudo dig-dns unconfigure-os
+```
+
+What it wires per OS (marker-scoped, so `unconfigure-os` removes exactly these):
+
+- **Linux** — a `systemd-resolved` drop-in `/etc/systemd/resolved.conf.d/dig.conf` routing `~dig`
+  at `127.0.0.5` (then reload + `resolvectl flush-caches`); if NetworkManager-dnsmasq owns
+  `/etc/resolv.conf` instead, `/etc/NetworkManager/dnsmasq.d/dig.conf`. A plain `resolv.conf`
+  (neither detected) is left untouched — rely on Path B (the PAC).
+- **macOS** — the boot-persistent `127.0.0.5` `lo0` alias (REQUIRED: macOS answers only `127.0.0.1`
+  on `lo0` otherwise, so the responder is unreachable without it), `/etc/resolver/dig`, and a
+  DNS-cache flush.
+- **Windows** — an NRPT rule `Add-DnsClientNrptRule -Namespace .dig -NameServers 127.0.0.5`.
+
+Not elevated → it refuses with a clear message and `"needs_elevation": true` in `--json` (it
+never half-applies).
+
+### The DoH-browser caveat (important)
+
+A browser with **Secure DNS / DNS-over-HTTPS** (Brave, Chrome, Edge, …) resolves names through its
+OWN encrypted upstream and BYPASSES the OS resolver — so `*.dig` will NOT resolve there even after
+`configure-os`. Such a browser needs EITHER:
+
+- **Path B** — point its proxy configuration at the PAC file `http://127.0.0.5:<port>/.dig/proxy.pac`
+  (`dig-dns pac` prints it; the port is the actually-bound one, `:80` or the `:8053` fallback); OR
+- **DoH off** — turn the browser's Secure DNS off, or apply a managed DoH-off policy. `configure-os
+  --browser-policy` sets a Chrome/Edge managed policy (`DnsOverHttpsMode=off`) for you. It is OPT-IN
+  (the native packages never pass it — a package must not silently put a browser under managed
+  policy) and never clobbers an existing org/MDM policy.
+
 ## Native install packages (per OS)
 
 Besides the raw binaries + `dig-dns install`, each release ships a NATIVE OS install package that
 registers the service for you (dig_ecosystem #503). The `dig-installer` downloads + runs these; you
 can also install them directly. They register the same identity (`net.dignetwork.dig-dns` / "DIG
-NETWORK: DNS") and state dir as `dig-dns install`, so the paths are interchangeable.
+NETWORK: DNS") and state dir as `dig-dns install`, so the paths are interchangeable. Each package's
+post-install ALSO runs `dig-dns configure-os` (above) so the package alone makes `*.dig` resolve
+system-wide (default ON, reversed on uninstall; opt-out noted per OS). The package NEVER sets a
+managed browser policy — Secure-DNS browsers still need Path B / DoH-off (the caveat above).
 
 **Windows — `dig-dns-<ver>-windows-x64.msi`** (elevated):
 
 ```powershell
-msiexec /i dig-dns-<ver>-windows-x64.msi /qn        # install + register + start the service
+msiexec /i dig-dns-<ver>-windows-x64.msi /qn        # install + register + start + configure-os
+msiexec /i dig-dns-<ver>-windows-x64.msi /qn CONFIGURE_OS=0   # ... but skip the OS resolver wiring
 sc query net.dignetwork.dig-dns                      # verify (RUNNING)
-msiexec /x dig-dns-<ver>-windows-x64.msi /qn         # uninstall (stops + removes the service)
+msiexec /x dig-dns-<ver>-windows-x64.msi /qn         # uninstall (stops + removes service + unconfigure-os)
 ```
 
 Installs `dig-dns.exe` under `C:\Program Files\DIG Network\DIG DNS` (added to PATH), registers the
 service running `dig-dns.exe run-service` (auto-start), and creates `C:\ProgramData\DigDns`. A
 re-run/upgrade is clean (fixed UpgradeCode + MajorUpgrade). A busy `:53` never wedges the installer.
+A deferred custom action runs `configure-os` on install + `unconfigure-os` on uninstall (opt out
+with the public property `CONFIGURE_OS=0`).
 
 **macOS — `dig-dns-<ver>-macos-{arm64,x64}.pkg`** (needs admin):
 
 ```sh
-sudo installer -pkg dig-dns-<ver>-macos-arm64.pkg -target /   # install + bootstrap the LaunchDaemon
+sudo installer -pkg dig-dns-<ver>-macos-arm64.pkg -target /   # install + bootstrap daemon + configure-os
 sudo launchctl print system/net.dignetwork.dig-dns            # verify
-# uninstall (no built-in uninstaller):
-sudo launchctl bootout system/net.dignetwork.dig-dns
-sudo rm -f /Library/LaunchDaemons/net.dignetwork.dig-dns.plist /usr/local/bin/dig-dns
-sudo rm -rf "/Library/Application Support/DigDns"
+sudo /usr/local/share/dig-dns/uninstall.sh                    # uninstall (unconfigure-os + remove payload)
 ```
+
+The `.pkg` runs `configure-os` unconditionally (no opt-out prompt) and ships an uninstaller at
+`/usr/local/share/dig-dns/uninstall.sh` (a `.pkg` has no built-in one) that reverses it and removes
+the payload + state dir.
 
 **Ubuntu — `dig-dns_<ver>_amd64.deb`** (via apt.dig.net once ingested, or directly):
 
 ```sh
-sudo apt-get install ./dig-dns_<ver>_amd64.deb   # install + daemon-reload + enable --now
-systemctl status net.dignetwork.dig-dns          # verify
-sudo apt-get remove dig-dns                       # uninstall (stop + disable + remove the unit)
+sudo apt-get install ./dig-dns_<ver>_amd64.deb    # install + daemon-reload + enable --now + configure-os
+sudo DIG_DNS_SKIP_CONFIGURE_OS=1 apt-get install ./dig-dns_<ver>_amd64.deb   # ... but skip the OS wiring
+systemctl status net.dignetwork.dig-dns           # verify
+sudo apt-get remove dig-dns                        # uninstall (unconfigure-os + stop + disable + remove)
 ```
 
 Installs `/usr/bin/dig-dns` + the systemd unit `net.dignetwork.dig-dns.service` (grants
-`CAP_NET_BIND_SERVICE` for `:53`/`:80`, `StateDirectory=/var/lib/dig-dns`). The `.deb` is a GitHub
-release asset that `apt.dig.net` ingests + GPG-signs into the apt repo (#425).
+`CAP_NET_BIND_SERVICE` for `:53`/`:80`, `StateDirectory=/var/lib/dig-dns`). The `postinst` runs
+`configure-os` (opt out with `DIG_DNS_SKIP_CONFIGURE_OS=1` in the install environment); the `prerm`
+runs `unconfigure-os` on removal (before the binary is deleted). The `.deb` is a GitHub release
+asset that `apt.dig.net` ingests + GPG-signs into the apt repo (#425).
 
 ## Deployment / release
 
