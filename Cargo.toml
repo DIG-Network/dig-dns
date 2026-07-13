@@ -10,7 +10,7 @@
 # root and increase on every PR (CLAUDE.md §2.4 / §3.6).
 [package]
 name = "dig-dns"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 description = "Local *.dig name resolution: a DNS responder + HTTP gateway resolving <storeId>.dig to DIG store content via a dig-node."
 license = "GPL-2.0-only"
@@ -69,6 +69,10 @@ base64 = "0.22"
 # digstore + dig-client-wasm. Pinned to the SAME digstore rev dig-node consumes. Light,
 # wasm-clean (no BLS/blst): sha2 + hkdf + aes-gcm-siv only.
 digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
+# The DIG_NODE_PORT constant (single source of truth for the §5.3 client->node localhost port,
+# 9778) shared with dig-node, dig-installer, dig-sdk and digstore so no consumer hardcodes it.
+# Not yet on crates.io, so sourced from git; pinned to the v0.3.0 release commit.
+dig-constants = { version = "0.3", git = "https://github.com/DIG-Network/dig-constants", rev = "438ac8caf9ffb80cadd10362deacd63763a7f141" }
 
 # --- Phase 2b: the async HTTP gateway server + node transport ---
 # Async runtime for the listener + the node client. Loopback-only, so no need for the

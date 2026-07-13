@@ -108,8 +108,10 @@ The PAC CLI + README + per-OS acceptance scripts (Phase 5) land next.
 `dig-dns` registers itself as an auto-starting OS service (Windows SCM / Linux systemd / macOS
 launchd) that runs `dig-dns serve`. Identity + contract (normative in `SPEC.md §13`):
 
-- **service id** `net.dignetwork.dig-dns` — the SCM name / launchd label / systemd unit
-  (`net.dignetwork.dig-dns.service`).
+- **service id** `net.dignetwork.dig-dns` — the SCM name / launchd label verbatim. `dig-dns
+  install`'s systemd unit FILE is named `dignetwork-dig-dns.service` instead (the
+  `service_manager` crate's `to_script_name()`, which drops the `net` qualifier) — distinct from
+  the native `.deb` package's own `net.dignetwork.dig-dns.service` (SPEC.md §13.1).
 - **Windows display name** `DIG NETWORK: DNS` — shown in the Services console.
 - **clean-reinstall** — if the service already exists, `install` does **stop → delete → wait →
   recreate → start** (never reconfigure-in-place), so a re-run never hits `CreateService 1073
@@ -199,12 +201,23 @@ fire. **Verify a release:** confirm the `vX.Y.Z` tag exists, the `Release dig-dn
 and the GitHub Release has the four binaries + the native packages (`.msi`, `.pkg` ×2, `.deb`)
 attached. The `.deb` is picked up + GPG-signed into the apt repo by `apt.dig.net` (#425).
 
-**Test coverage split (#503):** the packaging manifests (WiX `.wxs`, systemd unit, launchd plist,
-`.deb` control metadata) are unit-tested in `cargo test` on every PR (`src/packaging.rs` — asserts
-each shipped manifest matches the canonical service id / entrypoint / state dir / capability). The
-full per-OS package BUILD + install/verify/uninstall SMOKE test runs in `release.yml` on push to
-main + on the tag (GitHub runners give admin/root there). The MSI's service table is also verified
-buildable locally with the WiX tool.
+**Test coverage split (#503, #502):** three tiers, each proving a different registration path —
+
+1. The packaging manifests (WiX `.wxs`, systemd unit, launchd plist, `.deb` control metadata) are
+   unit-tested in `cargo test` on every PR (`src/packaging.rs` — asserts each shipped manifest
+   matches the canonical service id / entrypoint / state dir / capability).
+2. The `.github/workflows/ci.yml` **`service-smoke`** job runs `dig-dns install` (this crate's OWN
+   `src/service.rs::reinstall` clean-reinstall — stop → delete → recreate → start) against the
+   REAL Windows SCM / macOS launchd / Linux systemd `--user` on every PR, polls for `RUNNING`,
+   asserts the Windows display name, re-runs `install` to prove no `CreateService 1073`, then
+   stops + uninstalls and asserts the service is gone. This is the cross-OS acceptance for the
+   clean-reinstall contract itself (dig_ecosystem #240/#502/#499/#501).
+3. The full per-OS NATIVE PACKAGE (`.msi`/`.pkg`/`.deb`) BUILD + install/verify/uninstall smoke
+   test runs in `release.yml` on push to main + on the tag (GitHub runners give admin/root there).
+   These packages register the service via their OWN declarative mechanism — WiX `<ServiceInstall>`,
+   cargo-deb's systemd-units, pkgbuild's launchd `postinstall` — NOT `dig-dns install`, so tier 3 is
+   a DIFFERENT registration path than tier 2 and neither substitutes for the other. The MSI's
+   service table is also verified buildable locally with the WiX tool.
 
 **Consumers:** the dig-installer resolves these release binaries and invokes `dig-dns install`
 (which self-registers under `net.dignetwork.dig-dns` / "DIG NETWORK: DNS" and clean-reinstalls,

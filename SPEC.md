@@ -320,6 +320,10 @@ The local node serves plain **HTTP** on loopback; only `rpc.dig.net` is HTTPS. T
 choice SHOULD be cached for the session. A user-facing way to set a custom node
 (flag + env + config) is REQUIRED (§5.3).
 
+The `9778` port is sourced from `dig_constants::DIG_NODE_PORT` — the ecosystem-wide single
+source of truth shared with dig-node, dig-installer and dig-sdk — never a value dig-dns
+hardcodes independently (`src/node.rs::DEFAULT_LOCAL_NODE_PORT`).
+
 `dig.getManifest {store_id, root}` (the store's public path list) exists on the node but is
 served only for a **public store whose module is locally cached**; `dig-dns` MUST NOT depend
 on it for correctness (it uses the decoy/decrypt-fail + extension heuristic of §4.5 instead).
@@ -509,9 +513,18 @@ interchangeable and idempotent (the clean-reinstall, §13.2, makes a re-run safe
 | Windows display name | `DIG NETWORK: DNS` |
 
 - The **service id** is a reverse-DNS name used VERBATIM as the Windows SCM service name
-  (`sc create`/`query`/`start`/`stop`/`delete`), the launchd plist label, and the systemd unit
-  name (`net.dignetwork.dig-dns.service`). It MUST match the sibling convention
-  `net.dignetwork.dig-node` used by the dig-node service.
+  (`sc create`/`query`/`start`/`stop`/`delete`) and the launchd plist label. It MUST match the
+  sibling convention `net.dignetwork.dig-node` used by the dig-node service.
+- **systemd unit filename — two registration paths, two names.** The native `.deb` package
+  (§14) ships its OWN unit file at the fixed path `/lib/systemd/system/net.dignetwork.dig-dns.service`
+  — the service id used verbatim. `dig-dns install`'s systemd registration goes through the
+  `service_manager` crate instead, which names the unit file with `ServiceLabel::to_script_name()`
+  (`{organization}-{application}`, i.e. `dignetwork-dig-dns.service`) rather than the qualified id
+  — it DROPS the `net` qualifier and joins with `-`, not `.`. Both paths register the SAME program
+  (`dig-dns serve`) and are functionally interchangeable (§13, §13.2's clean-reinstall still
+  applies to the CLI path), but a script/monitoring tool addressing the unit by name must use the
+  name matching HOW it was installed. `src/service.rs::query_installed`'s Linux probe resolves
+  the `dignetwork-dig-dns.service` form to match what it actually registers (dig_ecosystem #502).
 - The **display name** is the human-friendly name shown in the Windows Services console. On
   Windows it is set with `sc config <id> displayname= "DIG NETWORK: DNS"` AFTER create (the
   underlying `sc create` sets the display name to the id). On launchd/systemd the service id is
