@@ -1,0 +1,25 @@
+#!/bin/sh
+# dig-dns macOS .pkg POSTINSTALL (#503).
+#
+# Create the machine-wide state + log dirs (SPEC §13.5), then (re)bootstrap + enable the
+# LaunchDaemon so the service starts now and on every boot (RunAtLoad in the plist).
+set -e
+
+PLIST=/Library/LaunchDaemons/net.dignetwork.dig-dns.plist
+
+# Machine-wide, identity-independent state dir (runtime.json) + logs.
+mkdir -p "/Library/Application Support/DigDns"
+chmod 755 "/Library/Application Support/DigDns"
+mkdir -p /Library/Logs/DigDns
+
+# launchd requires the plist be owned root:wheel and not group/world-writable.
+chown root:wheel "$PLIST"
+chmod 644 "$PLIST"
+
+# Clean-reinstall: bootout any lingering instance (preinstall already tried; harmless if gone),
+# then bootstrap the new daemon into the system domain and enable it.
+/bin/launchctl bootout system/net.dignetwork.dig-dns 2>/dev/null || true
+/bin/launchctl bootstrap system "$PLIST"
+/bin/launchctl enable system/net.dignetwork.dig-dns
+
+exit 0

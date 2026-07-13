@@ -1,0 +1,9 @@
+#!/bin/sh
+# dig-dns macOS .pkg PREINSTALL (#503).
+#
+# Best-effort: tear down any previously-bootstrapped dig-dns LaunchDaemon BEFORE the payload
+# replaces the binary + plist, so the postinstall re-bootstraps the new one cleanly. This mirrors
+# the clean-reinstall contract (SPEC §13.2) — a re-run / upgrade never leaves a stale daemon
+# pinned to the old binary. A missing daemon (fresh install) is not an error.
+/bin/launchctl bootout system/net.dignetwork.dig-dns 2>/dev/null || true
+exit 0

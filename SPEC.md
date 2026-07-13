@@ -604,6 +604,62 @@ reads/writes `runtime.json` within it.
 
 ---
 
+## 14. Native OS install packages
+
+`dig-dns` COMPILES its own native OS install packages that install it **as a service** (dig_ecosystem
+#503). The `dig-installer` downloads + runs them; it does NOT hand-roll service registration. Each
+package registers the SAME canonical identity (§13.1) running the SAME entrypoint, and creates the
+SAME machine-wide state dir (§13.5), as a manual `dig-dns install` — the packaged and manual paths
+are interchangeable and idempotent. A package installs ONLY the service; `dig-dns` owns `*.dig`
+resolution, so it registers NO OS scheme handler (that is dig-node's job for `chia://`/`urn:dig:chia:`).
+
+Per OS the release workflow (`.github/workflows/release.yml`) builds one package on the matching
+runner OS and attaches it to the `vX.Y.Z` GitHub Release alongside the raw binaries.
+
+| OS | Package | Built by | Service mechanism | Binary path | State dir |
+|---|---|---|---|---|---|
+| Windows | `dig-dns-<ver>-windows-x64.msi` | WiX (`wix/main.wxs`) | SCM `ServiceInstall`/`ServiceControl` | `C:\Program Files\DIG Network\DIG DNS\dig-dns.exe` | `C:\ProgramData\DigDns` |
+| macOS | `dig-dns-<ver>-macos-{arm64,x64}.pkg` | `pkgbuild`/`productbuild` (`packaging/macos`) | LaunchDaemon | `/usr/local/bin/dig-dns` | `/Library/Application Support/DigDns` |
+| Ubuntu | `dig-dns_<ver>_amd64.deb` | `cargo-deb` (`Cargo.toml` metadata + `packaging/linux`) | systemd unit | `/usr/bin/dig-dns` | `/var/lib/dig-dns` |
+
+### 14.1 Windows `.msi` (WiX)
+
+- Registers the service **`net.dignetwork.dig-dns`** (display **`DIG NETWORK: DNS`**, §13.1) via
+  `ServiceInstall`, `Type=ownProcess`, `Start=auto`, `Account=LocalSystem`, `Arguments=run-service`
+  — the SCM-protocol entrypoint (§13.4), NOT a host shim.
+- `ServiceControl` **starts** the service on install and **stops + removes** it on uninstall, with
+  `Wait=no` so a busy `:53` never wedges `msiexec` (the service reports `SERVICE_RUNNING` before its
+  binds, then degrades — §13.4 / #499).
+- Creates `C:\ProgramData\DigDns` (§13.5). It inherits ProgramData's ACL — SYSTEM + Administrators
+  full control, Users (incl. the installing user) read — which satisfies the "SYSTEM+Administrators
+  full, installing user READ" requirement; no custom ACL is applied (the dir holds no secret).
+- Adds the install dir to the system `PATH`; a fixed `UpgradeCode` + `MajorUpgrade` gives clean
+  in-place upgrade and uninstall.
+
+### 14.2 macOS `.pkg`
+
+- Installs the binary at `/usr/local/bin/dig-dns` and a LaunchDaemon
+  `/Library/LaunchDaemons/net.dignetwork.dig-dns.plist` (`RunAtLoad` + `KeepAlive`) running
+  `dig-dns serve`.
+- `postinstall` creates `/Library/Application Support/DigDns`, then `launchctl bootstrap system` +
+  `launchctl enable` the daemon; `preinstall` `launchctl bootout`s any existing daemon first so an
+  upgrade re-bootstraps cleanly (§13.2).
+
+### 14.3 Ubuntu `.deb`
+
+- Installs the binary at `/usr/bin/dig-dns` and the systemd unit
+  `/lib/systemd/system/net.dignetwork.dig-dns.service` running `dig-dns serve`.
+- The unit grants **`AmbientCapabilities=CAP_NET_BIND_SERVICE`** (+ `CapabilityBoundingSet`) — the
+  ONLY privilege `dig-dns` needs, to bind `:53`/`:80` on the loopback IP — and uses
+  `StateDirectory=dig-dns` so systemd creates `/var/lib/dig-dns` (§13.5).
+- Maintainer scripts run `systemctl daemon-reload` + `enable --now` on install and `stop` + `disable`
+  on removal.
+- Control metadata is apt-correct + stable (`Package: dig-dns`, `Architecture: amd64`, auto-computed
+  `Depends`, `Section: net`), so `apt.dig.net` ingests the release-asset `.deb` and GPG-signs it into
+  the apt repo (#425).
+
+---
+
 ## Appendix A — default ports / addresses
 
 | Service | Address | Transport |

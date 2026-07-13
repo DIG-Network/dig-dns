@@ -33,6 +33,9 @@
 //!   hyper requests to [`gateway::handle`].
 //! - [`doctor`] — the `doctor` diagnostic (SPEC §9): independent per-link checks of both paths
 //!   with fix hints + `--json`, exiting non-zero when a `.dig` URL cannot load.
+//! - [`packaging`] — the native OS install-package contract (#503): the single source of the
+//!   systemd unit + launchd plist the `.deb`/`.pkg` ship, plus the packaging invariants (service
+//!   id, entrypoint, state dir) the committed manifests are tested against.
 //! - [`pac`] — Proxy Auto-Config generation for Path B (the PAC control endpoint + CLI).
 //! - [`config`] — service configuration: loopback IP / ports / TLD / node endpoint,
 //!   with flag → env → file override precedence.
@@ -63,6 +66,7 @@ pub mod host;
 pub mod label;
 pub mod node;
 pub mod pac;
+pub mod packaging;
 pub mod server;
 pub mod service;
 pub mod service_run;

@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  dig-dns Windows installer (MSI) — WiX v4/v5 schema (dig_ecosystem #503).
+
+  Installs dig-dns.exe and registers it as the auto-starting Windows service
+  net.dignetwork.dig-dns (display "DIG NETWORK: DNS") running `dig-dns.exe run-service` — the
+  real SCM-protocol entrypoint (SPEC §13.4), NOT a host shim. ServiceControl starts the service
+  on install and stops + removes it on uninstall. Wait="no" so a busy :53 never wedges msiexec
+  (the service reports SERVICE_RUNNING before its binds, then degrades — v0.9.1 / #499).
+
+  Creates C:\ProgramData\DigDns for the machine-wide runtime state (SPEC §13.5). It inherits
+  ProgramData's ACL — SYSTEM + Administrators full control, Users (incl. the installing user)
+  read — which is exactly the "SYSTEM+Administrators full, installing user READ" requirement, so
+  no custom PermissionEx is needed (the dir holds no secret; dig-dns is unauthenticated loopback).
+
+  Adds the install dir to the system PATH. A fixed UpgradeCode + MajorUpgrade gives clean in-place
+  upgrade and uninstall.
+
+  CI builds it with the Cargo version + the dir holding the freshly-built exe:
+    wix build wix/main.wxs -arch x64 -d Version=<cargo version> -d BinDir=<dir with dig-dns.exe> -o <out.msi>
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="DIG NETWORK: DNS"
+      Manufacturer="DIG Network"
+      Version="$(var.Version)"
+      UpgradeCode="420A4B42-0670-4FA1-9765-DB39652B06D0"
+      Scope="perMachine"
+      Compressed="yes">
+
+    <SummaryInformation Description="DIG NETWORK: DNS — local *.dig resolver (service installer)" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of DIG NETWORK: DNS is already installed." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Install location: Program Files\DIG Network\DIG DNS -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="CompanyFolder" Name="DIG Network">
+        <Directory Id="INSTALLFOLDER" Name="DIG DNS" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Machine-wide state dir: C:\ProgramData\DigDns (SPEC §13.5) -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DigDnsDataDir" Name="DigDns" />
+    </StandardDirectory>
+
+    <!-- The service binary, its registration, and the PATH entry -->
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="DigDnsExe" Bitness="always64">
+        <File Id="DigDnsExe" Source="$(var.BinDir)\dig-dns.exe" KeyPath="yes" />
+
+        <!-- Register the auto-start service running `dig-dns.exe run-service` (SPEC §13.1/§13.4). -->
+        <ServiceInstall
+            Id="DigDnsServiceInstall"
+            Name="net.dignetwork.dig-dns"
+            DisplayName="DIG NETWORK: DNS"
+            Description="Local *.dig name resolution: a DNS responder + HTTP gateway resolving &lt;storeId&gt;.dig to DIG store content via a dig-node."
+            Type="ownProcess"
+            Start="auto"
+            ErrorControl="normal"
+            Account="LocalSystem"
+            Arguments="run-service" />
+
+        <!-- Start on install; stop + delete on uninstall. Wait="no": a busy :53 must not wedge
+             the installer (the service reports RUNNING fast then degrades — #499). -->
+        <ServiceControl
+            Id="DigDnsServiceControl"
+            Name="net.dignetwork.dig-dns"
+            Start="install"
+            Stop="both"
+            Remove="uninstall"
+            Wait="no" />
+
+        <!-- Put the install dir on the system PATH. -->
+        <Environment
+            Id="PathEnv"
+            Name="PATH"
+            Value="[INSTALLFOLDER]"
+            Permanent="no"
+            Part="last"
+            Action="set"
+            System="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Create the ProgramData\DigDns state dir; remove it on uninstall (inherits ProgramData ACL). -->
+    <Component Id="DigDnsDataFolder" Directory="DigDnsDataDir" Guid="53B15BA5-7FA9-4270-B70A-39242A6D461D">
+      <CreateFolder />
+      <RemoveFolder Id="RemoveDigDnsDataDir" On="uninstall" />
+      <RegistryValue Root="HKLM" Key="Software\DIG Network\DIG DNS" Name="DataDir" Type="string" Value="[DigDnsDataDir]" KeyPath="yes" />
+    </Component>
+
+    <Feature Id="Main" Title="DIG NETWORK: DNS" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+      <ComponentRef Id="DigDnsDataFolder" />
+    </Feature>
+  </Package>
+</Wix>
