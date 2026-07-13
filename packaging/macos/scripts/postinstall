@@ -17,9 +17,11 @@ chown root:wheel "$PLIST"
 chmod 644 "$PLIST"
 
 # Clean-reinstall: bootout any lingering instance (preinstall already tried; harmless if gone),
-# then bootstrap the new daemon into the system domain and enable it.
+# then bootstrap the new daemon into the system domain and enable it. bootstrap/enable are
+# best-effort (|| true): the plist's RunAtLoad starts the daemon regardless, and a benign
+# launchctl return (e.g. a transient domain state) must not fail the whole install.
 /bin/launchctl bootout system/net.dignetwork.dig-dns 2>/dev/null || true
-/bin/launchctl bootstrap system "$PLIST"
-/bin/launchctl enable system/net.dignetwork.dig-dns
+/bin/launchctl bootstrap system "$PLIST" || true
+/bin/launchctl enable system/net.dignetwork.dig-dns || true
 
 exit 0
