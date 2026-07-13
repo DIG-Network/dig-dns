@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.11.1] - 2026-07-13
+
+### Bug Fixes
+- Repair malformed XML comment in wix/main.wxs breaking MSI build (#530) (#17)
+
 ## [0.11.0] - 2026-07-13
 
 ### Features
