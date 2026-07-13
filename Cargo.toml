@@ -10,12 +10,39 @@
 # root and increase on every PR (CLAUDE.md §2.4 / §3.6).
 [package]
 name = "dig-dns"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 description = "Local *.dig name resolution: a DNS responder + HTTP gateway resolving <storeId>.dig to DIG store content via a dig-node."
 license = "GPL-2.0-only"
 repository = "https://github.com/DIG-Network/dig-dns"
 readme = "README.md"
+
+# --- Native OS install packages (dig_ecosystem #503) ----------------------------------------
+# The Ubuntu `.deb` is built by cargo-deb from this metadata + the systemd unit under
+# packaging/linux, published as a GitHub release asset, and ingested + GPG-signed into the apt
+# repo by apt.dig.net (#425). The control fields are kept apt-correct + stable (Package name is
+# the crate name `dig-dns`; Architecture is derived from the build target; Depends is auto-computed
+# from the binary's shared-library needs). The Windows `.msi` (wix/main.wxs) + macOS `.pkg`
+# (packaging/macos) are built by the release workflow, not cargo — see .github/workflows/release.yml.
+[package.metadata.deb]
+maintainer = "DIG Network <dev@dig.net>"
+section = "net"
+priority = "optional"
+extended-description = """
+dig-dns is the local *.dig resolver: a DNS responder + HTTP gateway that resolves
+<storeId>.dig hostnames to DIG Network store content fetched from a dig-node. It installs as an
+auto-starting systemd service (net.dignetwork.dig-dns) bound to a loopback IP; it holds no secret
+and never acts as an open proxy."""
+
+# cargo-deb wires the systemd unit: it installs packaging/linux/net.dignetwork.dig-dns.service to
+# /lib/systemd/system and generates the maintainer scripts (daemon-reload + enable --now on
+# install, stop + disable on removal). The service needs CAP_NET_BIND_SERVICE for :53/:80 (granted
+# in the unit) and a machine-wide state dir /var/lib/dig-dns (created via the unit's StateDirectory).
+[package.metadata.deb.systemd-units]
+unit-name = "net.dignetwork.dig-dns"
+unit-scripts = "packaging/linux"
+enable = true
+start = true
 
 [lib]
 name = "dig_dns"

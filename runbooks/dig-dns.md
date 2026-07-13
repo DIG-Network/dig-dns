@@ -136,6 +136,48 @@ Install level: user-level (no elevation) on Linux/macOS; system-level (needs Adm
 Windows. The installed Windows service runs the hidden `run-service` entrypoint (the SCM
 protocol dispatcher) so the SCM does not kill it with error 1053.
 
+## Native install packages (per OS)
+
+Besides the raw binaries + `dig-dns install`, each release ships a NATIVE OS install package that
+registers the service for you (dig_ecosystem #503). The `dig-installer` downloads + runs these; you
+can also install them directly. They register the same identity (`net.dignetwork.dig-dns` / "DIG
+NETWORK: DNS") and state dir as `dig-dns install`, so the paths are interchangeable.
+
+**Windows — `dig-dns-<ver>-windows-x64.msi`** (elevated):
+
+```powershell
+msiexec /i dig-dns-<ver>-windows-x64.msi /qn        # install + register + start the service
+sc query net.dignetwork.dig-dns                      # verify (RUNNING)
+msiexec /x dig-dns-<ver>-windows-x64.msi /qn         # uninstall (stops + removes the service)
+```
+
+Installs `dig-dns.exe` under `C:\Program Files\DIG Network\DIG DNS` (added to PATH), registers the
+service running `dig-dns.exe run-service` (auto-start), and creates `C:\ProgramData\DigDns`. A
+re-run/upgrade is clean (fixed UpgradeCode + MajorUpgrade). A busy `:53` never wedges the installer.
+
+**macOS — `dig-dns-<ver>-macos-{arm64,x64}.pkg`** (needs admin):
+
+```sh
+sudo installer -pkg dig-dns-<ver>-macos-arm64.pkg -target /   # install + bootstrap the LaunchDaemon
+sudo launchctl print system/net.dignetwork.dig-dns            # verify
+# uninstall (no built-in uninstaller):
+sudo launchctl bootout system/net.dignetwork.dig-dns
+sudo rm -f /Library/LaunchDaemons/net.dignetwork.dig-dns.plist /usr/local/bin/dig-dns
+sudo rm -rf "/Library/Application Support/DigDns"
+```
+
+**Ubuntu — `dig-dns_<ver>_amd64.deb`** (via apt.dig.net once ingested, or directly):
+
+```sh
+sudo apt-get install ./dig-dns_<ver>_amd64.deb   # install + daemon-reload + enable --now
+systemctl status net.dignetwork.dig-dns          # verify
+sudo apt-get remove dig-dns                       # uninstall (stop + disable + remove the unit)
+```
+
+Installs `/usr/bin/dig-dns` + the systemd unit `net.dignetwork.dig-dns.service` (grants
+`CAP_NET_BIND_SERVICE` for `:53`/`:80`, `StateDirectory=/var/lib/dig-dns`). The `.deb` is a GitHub
+release asset that `apt.dig.net` ingests + GPG-signs into the apt repo (#425).
+
 ## Deployment / release
 
 Tag-driven, per CLAUDE.md §3.6:
@@ -148,12 +190,21 @@ Tag-driven, per CLAUDE.md §3.6:
    `secrets.RELEASE_TOKEN` (a classic PAT) so the tag triggers the deploy-on-tag workflow and
    the changelog commit is allowed past branch protection.
 3. The pushed tag fires `.github/workflows/release.yml`, which builds the `dig-dns` binary for
-   windows-x64 / linux-x64 / macos-arm64 / macos-x64 and attaches them to a GitHub Release as
-   `dig-dns-<ver>-<os-arch>[.exe]`.
+   windows-x64 / linux-x64 / macos-arm64 / macos-x64 AND the native install packages (the Windows
+   `.msi`, the two macOS `.pkg`s, the Ubuntu `.deb`), smoke-tests each on its runner OS
+   (install → verify service registered → uninstall), and attaches them all to a GitHub Release.
 
 **Secrets:** `RELEASE_TOKEN` (repo or org secret) is REQUIRED for the tag-on-merge release to
-fire. **Verify a release:** confirm the `vX.Y.Z` tag exists, the `Release dig-dns` run is
-green, and the GitHub Release has the four binaries attached.
+fire. **Verify a release:** confirm the `vX.Y.Z` tag exists, the `Release dig-dns` run is green,
+and the GitHub Release has the four binaries + the native packages (`.msi`, `.pkg` ×2, `.deb`)
+attached. The `.deb` is picked up + GPG-signed into the apt repo by `apt.dig.net` (#425).
+
+**Test coverage split (#503):** the packaging manifests (WiX `.wxs`, systemd unit, launchd plist,
+`.deb` control metadata) are unit-tested in `cargo test` on every PR (`src/packaging.rs` — asserts
+each shipped manifest matches the canonical service id / entrypoint / state dir / capability). The
+full per-OS package BUILD + install/verify/uninstall SMOKE test runs in `release.yml` on push to
+main + on the tag (GitHub runners give admin/root there). The MSI's service table is also verified
+buildable locally with the WiX tool.
 
 **Consumers:** the dig-installer resolves these release binaries and invokes `dig-dns install`
 (which self-registers under `net.dignetwork.dig-dns` / "DIG NETWORK: DNS" and clean-reinstalls,

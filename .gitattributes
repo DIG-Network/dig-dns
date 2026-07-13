@@ -1,0 +1,6 @@
+# Native install-package manifests + scripts MUST ship with LF line endings regardless of the
+# checkout platform's autocrlf setting: a launchd plist / systemd unit / shell maintainer script
+# with CRLF can be rejected or mis-parsed by the OS at install time (#503).
+packaging/** text eol=lf
+wix/** text eol=lf
+scripts/*.sh text eol=lf

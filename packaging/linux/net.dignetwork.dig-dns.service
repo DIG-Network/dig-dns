@@ -1,0 +1,27 @@
+[Unit]
+Description=DIG NETWORK: DNS — local *.dig resolver (DNS responder + HTTP gateway)
+Documentation=https://docs.dig.net
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/dig-dns serve
+Restart=on-failure
+RestartSec=5
+# dig-dns binds :53 (DNS) + :80 (HTTP gateway) on a loopback IP; CAP_NET_BIND_SERVICE is
+# the ONLY privilege it needs (SPEC §5 loopback-only; it holds no secret).
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# Machine-wide, identity-independent runtime state (SPEC §13.5): systemd creates
+# /var/lib/dig-dns and the service records runtime.json there.
+StateDirectory=dig-dns
+Environment=DIG_DNS_STATE_DIR=/var/lib/dig-dns
+# Hardening — loopback-only service, no secret material.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
