@@ -6,8 +6,11 @@
 //! the **clean-reinstall** contract:
 //!
 //! * **Service id** — [`SERVICE_LABEL`] `net.dignetwork.dig-dns`, the reverse-DNS name used
-//!   verbatim as the Windows SCM service name (`sc create`/`query`/`start`/`stop`/`delete`),
-//!   the launchd plist label, and the systemd unit name.
+//!   verbatim as the Windows SCM service name (`sc create`/`query`/`start`/`stop`/`delete`) and
+//!   the launchd plist label. On Linux the `service_manager` crate names the systemd unit FILE
+//!   with [`ServiceLabel::to_script_name`] instead (`dignetwork-dig-dns`, dropping the `net`
+//!   qualifier) — see `query_installed`'s doc comment and `SPEC.md` §13.1 for why the probe
+//!   below resolves that form rather than the qualified id.
 //! * **Display name** — [`SERVICE_DISPLAY_NAME`] "DIG NETWORK: DNS", the human-friendly name
 //!   shown in the Windows Services console (set with `sc config … displayname=` after create,
 //!   because `service-manager` 0.7's `sc create` hardcodes the display name to the service id).
@@ -308,7 +311,7 @@ impl SystemServiceBackend {
 
 impl ServiceBackend for SystemServiceBackend {
     fn is_installed(&self) -> io::Result<bool> {
-        Ok(query_installed(&self.label.to_qualified_name()))
+        Ok(query_installed(&self.label))
     }
 
     fn stop(&self) -> io::Result<()> {
@@ -349,13 +352,18 @@ impl ServiceBackend for SystemServiceBackend {
     }
 }
 
-/// Probe whether a service named `service_name` is registered, per OS. Best-effort: a probe
-/// that cannot run (tool missing) reports `false` so the clean-reinstall proceeds to create.
+/// Probe whether `label` is registered, per OS. Best-effort: a probe that cannot run (tool
+/// missing) reports `false` so the clean-reinstall proceeds to create. Each OS resolves `label`
+/// to the name-form its OWN `service_manager` backend actually registers under — see the
+/// per-`query_installed` doc comments for why these differ.
 #[cfg(windows)]
-fn query_installed(service_name: &str) -> bool {
-    // `sc query <name>` exits 0 when the service exists, 1060 (does-not-exist) otherwise.
+fn query_installed(label: &ServiceLabel) -> bool {
+    // `service_manager::ScServiceManager` (Windows) names the service with the fully-qualified
+    // id verbatim (`ctx.label.to_qualified_name()`), matching SERVICE_LABEL. `sc query <name>`
+    // exits 0 when it exists, 1060 (does-not-exist) otherwise.
+    let service_name = label.to_qualified_name();
     std::process::Command::new("sc.exe")
-        .args(["query", service_name])
+        .args(["query", &service_name])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -366,8 +374,11 @@ fn query_installed(service_name: &str) -> bool {
 /// macOS launchd existence probe: `launchctl print <domain>/<label>` exits 0 when the service
 /// is bootstrapped.
 #[cfg(target_os = "macos")]
-fn query_installed(service_name: &str) -> bool {
-    let domain = launchd_domain_target(service_name);
+fn query_installed(label: &ServiceLabel) -> bool {
+    // `service_manager::LaunchdServiceManager` names the plist with the fully-qualified id
+    // verbatim (`ctx.label.to_qualified_name()`), matching SERVICE_LABEL.
+    let service_name = label.to_qualified_name();
+    let domain = launchd_domain_target(&service_name);
     std::process::Command::new("launchctl")
         .args(["print", &domain])
         .stdout(std::process::Stdio::null())
@@ -377,21 +388,48 @@ fn query_installed(service_name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Linux systemd existence probe: `systemctl [--user] cat <label>.service` exits 0 when the
-/// unit file exists (non-zero "No files found" otherwise).
+/// Linux systemd existence probe: is the unit FILE present at the path `service-manager`'s
+/// `SystemdServiceManager` writes it to (the user unit dir for our user-level install; see
+/// [`PREFERS_USER_LEVEL`])?
+///
+/// **Naming (the dig_ecosystem #502 bug):** unlike the Windows/macOS backends above,
+/// `SystemdServiceManager` does NOT name the unit file with the fully-qualified id
+/// (`to_qualified_name`, `"net.dignetwork.dig-dns"`) — it names it with `to_script_name()`
+/// (`"{organization}-{application}"`, i.e. `"dignetwork-dig-dns"`, DROPPING the `net` qualifier
+/// entirely). Probing for the qualified-name file (the original implementation, mirroring
+/// Windows/macOS) therefore checked a path that never existed, so `is_installed` silently always
+/// reported `false` even immediately after a real, confirmed-RUNNING install — defeating
+/// [`reinstall`]'s existed-detection (`report.existed`/`reinstalled` wrongly `false`) and
+/// `status`'s `registered` field. Only real-OS testing surfaces this (dig_ecosystem #502's
+/// service-smoke CI caught it; the mock-backed unit tests below can't, since the mock never
+/// shells out or touches a real path). Checking the file the manager ACTUALLY writes is also
+/// immune to any systemd-manager load/cache timing a `systemctl cat` round-trip could have.
+///
+/// This is a probe-naming fix only — it does not change what `create`/`delete` register the
+/// service AS (still the [`SERVICE_LABEL`] identity via the `service_manager` crate); see
+/// `SPEC.md` §13.1 for the resulting on-disk unit filename this implies.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn query_installed(service_name: &str) -> bool {
-    let unit = format!("{service_name}.service");
-    let mut cmd = std::process::Command::new("systemctl");
-    if PREFERS_USER_LEVEL {
-        cmd.arg("--user");
-    }
-    cmd.args(["cat", &unit])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
+fn query_installed(label: &ServiceLabel) -> bool {
+    systemd_unit_file_path(&label.to_script_name())
+        .map(|p| p.is_file())
         .unwrap_or(false)
+}
+
+/// Where `service-manager`'s systemd backend places the unit file for our install level (see
+/// [`PREFERS_USER_LEVEL`]): the user unit dir (`$XDG_CONFIG_HOME/systemd/user`, `None` only if
+/// the home directory cannot be resolved) or the global `/etc/systemd/system`. `unit_stem` MUST
+/// be a [`ServiceLabel::to_script_name`] result, not [`ServiceLabel::to_qualified_name`] (see
+/// [`query_installed`] above). PURE path arithmetic reusing the SAME helpers
+/// `service_manager::SystemdServiceManager` itself calls, so this can never drift from where
+/// `create`/`delete` actually write.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn systemd_unit_file_path(unit_stem: &str) -> Option<PathBuf> {
+    let dir = if PREFERS_USER_LEVEL {
+        service_manager::systemd_user_dir_path().ok()?
+    } else {
+        service_manager::systemd_global_dir_path()
+    };
+    Some(dir.join(format!("{unit_stem}.service")))
 }
 
 /// The launchd domain target (`gui/<uid>/<label>` for a user agent, `system/<label>` for a
@@ -583,19 +621,36 @@ fn probe_serving(config: &Config) -> bool {
     probe_resolve(&ip, config.http_port) || probe_resolve(&ip, config.http_fallback_port)
 }
 
+/// How long [`probe_resolve`] waits on EACH phase (connect, then read) before giving up. Applied
+/// to the CONNECT itself (not just the post-connect read/write) — see [`probe_resolve`]'s doc
+/// comment for why that matters.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Minimal blocking HTTP/1.0 `GET /.dig/resolve-probe` over loopback; returns whether the
 /// status line is 2xx (the gateway answers this liveness endpoint with `204`).
+///
+/// Uses [`TcpStream::connect_timeout`], NOT plain `connect`, bounding the CONNECT phase itself
+/// (dig_ecosystem #502): connecting to a loopback IP the OS has no interface/route entry for —
+/// e.g. `127.0.0.5` on macOS, which (unlike Linux/Windows) does NOT accept the whole `127.0.0.0/8`
+/// range on `lo0` by default, only whatever is explicitly aliased (SPEC §5, `doctor`'s
+/// `loopback_ip` check) — can hang rather than fail-fast with "connection refused". A real
+/// service-smoke CI run against a bare macOS runner (no alias yet applied) demonstrated this
+/// exact hang: `dig-dns status` blocked for 10+ minutes instead of promptly reporting "not
+/// serving". A diagnostic command MUST never hang on the very condition it exists to detect.
 fn probe_resolve(ip: &str, port: u16) -> bool {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
     let addr = format!("{ip}:{port}");
-    let mut stream = match TcpStream::connect(&addr) {
+    let Ok(socket_addr) = addr.parse() else {
+        return false;
+    };
+    let mut stream = match TcpStream::connect_timeout(&socket_addr, PROBE_TIMEOUT) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_read_timeout(Some(PROBE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(PROBE_TIMEOUT));
     let req =
         format!("GET /.dig/resolve-probe HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
     if stream.write_all(req.as_bytes()).is_err() {
@@ -640,6 +695,39 @@ mod tests {
         let l = label().expect("constant label must parse");
         // `to_qualified_name` must reproduce the literal id we register/query under.
         assert_eq!(l.to_qualified_name(), SERVICE_LABEL);
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn systemd_unit_file_path_lands_under_the_expected_dir_with_the_service_suffix() {
+        // Regression for dig_ecosystem #502: `query_installed` must resolve the SAME path
+        // `service-manager`'s SystemdServiceManager writes to (whichever level PREFERS_USER_LEVEL
+        // selects), never a path a real reinstall wouldn't actually touch.
+        let path = systemd_unit_file_path("dignetwork-dig-dns").expect("home dir resolvable");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("dignetwork-dig-dns.service")
+        );
+        if PREFERS_USER_LEVEL {
+            assert!(path.ends_with("systemd/user/dignetwork-dig-dns.service"));
+        } else {
+            assert_eq!(
+                path,
+                PathBuf::from("/etc/systemd/system/dignetwork-dig-dns.service")
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn service_label_script_name_drops_the_qualifier_unlike_qualified_name() {
+        // Pins the exact naming mismatch dig_ecosystem #502 uncovered: `to_script_name()` (what
+        // `SystemdServiceManager` actually files the unit under) is NOT `to_qualified_name()`
+        // (what SERVICE_LABEL/Windows/macOS use) -- it drops the `net` qualifier and joins with
+        // `-` instead of `.`. `query_installed`'s Linux branch MUST use `to_script_name()`.
+        let l = label().expect("constant label must parse");
+        assert_eq!(l.to_qualified_name(), "net.dignetwork.dig-dns");
+        assert_eq!(l.to_script_name(), "dignetwork-dig-dns");
     }
 
     #[test]
@@ -751,6 +839,20 @@ mod tests {
     fn probe_resolve_is_false_on_a_refused_connection() {
         // Nothing listens on this high loopback port → connect refused → not serving.
         assert!(!probe_resolve("127.0.0.1", 59_125));
+    }
+
+    #[test]
+    fn probe_resolve_never_blocks_past_the_probe_timeout() {
+        // Regression for dig_ecosystem #502: a real macOS service-smoke CI run hung for 10+
+        // minutes because plain `TcpStream::connect` (unlike `connect_timeout`) has no bound on
+        // the CONNECT phase itself -- connecting to a loopback IP the OS has no route/interface
+        // entry for can hang rather than fail-fast. This can't reproduce that exact
+        // unassigned-loopback hang hermetically, but it pins that `probe_resolve` never takes
+        // meaningfully longer than [`PROBE_TIMEOUT`], guarding against a future regression back
+        // to an unbounded connect.
+        let start = std::time::Instant::now();
+        assert!(!probe_resolve("127.0.0.1", 59_126));
+        assert!(start.elapsed() < PROBE_TIMEOUT + Duration::from_secs(1));
     }
 
     // -- clean-reinstall orchestration (the core contract), via a recording mock ----------

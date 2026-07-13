@@ -16,8 +16,10 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 
-/// The dig-node's default localhost control port (plain HTTP loopback).
-pub const DEFAULT_LOCAL_NODE_PORT: u16 = 9778;
+/// The dig-node's default localhost control port (plain HTTP loopback). Re-exported from
+/// `dig_constants::DIG_NODE_PORT` — the ecosystem-wide single source of truth for the §5.3
+/// client->node localhost port — so dig-dns can never drift from dig-node/dig-installer/dig-sdk.
+pub const DEFAULT_LOCAL_NODE_PORT: u16 = dig_constants::DIG_NODE_PORT;
 /// The best-effort bare `dig.local` node base (the installed local node).
 pub const DIG_LOCAL_BASE: &str = "http://dig.local";
 /// The public gateway — the terminal ladder fallback.
@@ -229,6 +231,15 @@ mod tests {
 
     fn b64(bytes: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn local_node_port_is_wired_to_the_shared_dig_constants_crate() {
+        // Guards against the port silently drifting from the ecosystem-wide single source of
+        // truth (dig_ecosystem #502) — dig-node/dig-installer/dig-sdk all resolve the SAME
+        // constant, so a change there must be a deliberate, coordinated ecosystem release.
+        assert_eq!(DEFAULT_LOCAL_NODE_PORT, dig_constants::DIG_NODE_PORT);
+        assert_eq!(DEFAULT_LOCAL_NODE_PORT, 9778);
     }
 
     #[test]

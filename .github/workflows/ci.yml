@@ -89,3 +89,124 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-targets --locked
+
+  # ---------------------------------------------------------------------------------------
+  # Service smoke — proves `dig-dns install` end-to-end against the REAL OS service manager
+  # (Windows SCM / macOS launchd / Linux systemd --user) on every platform dig-dns ships for.
+  # This is the cross-OS acceptance evidence for dig_ecosystem #240 + #502: the clean-reinstall
+  # contract (src/service.rs) is unit-tested against a mock everywhere, but only a real install
+  # proves the actual `sc.exe`/`launchctl`/`systemctl` calls succeed.
+  #
+  # Deliberately NO port env overrides: `service-manager`'s Windows SCM backend (`sc create`)
+  # does not pass a service's `environment` through at all (`sc.exe` has no such flag), so a
+  # config override baked at install time is silently dropped on Windows -- an override here
+  # would make the smoke assert against a port the real service never binds. Instead this
+  # relies on the ALREADY-SHIPPED, already-unit-tested primary/fallback dance (src/server.rs
+  # `bind_listener`: try :80, fall back to the deterministic :8053 on ANY bind error, including
+  # unprivileged/permission-denied) -- the same graceful degradation release.yml's native-package
+  # smoke tests already exercise successfully. So the assertion here is "the service reaches
+  # RUNNING", never a literal :53/:80 bind.
+  # ---------------------------------------------------------------------------------------
+  service-smoke:
+    name: Service smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-14, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: service-smoke-${{ matrix.os }}
+
+      # Linux user-level systemd units need a logind session bus. GitHub's ubuntu-latest runner
+      # is a full VM (not a container) so one is normally already present; `enable-linger` +
+      # exporting XDG_RUNTIME_DIR is defensive belt-and-braces so `systemctl --user` never fails
+      # for a missing bus rather than a real service bug.
+      - name: Prepare the user systemd session (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo loginctl enable-linger "$(id -un)" || true
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+
+      # macOS does NOT accept the whole 127.0.0.0/8 range on lo0 by default (unlike Linux/
+      # Windows) -- only 127.0.0.1 is there out of the box. dig-dns's default bind IP (127.0.0.5,
+      # SPEC S5) needs the SAME loopback alias the real installer applies (README.md/doctor.rs's
+      # documented fix); without it the gateway can never bind, so `dig-dns status` would find
+      # nothing listening on EITHER the primary or fallback port (same unassigned IP, only the
+      # port differs).
+      - name: Alias the dig-dns loopback IP on lo0 (macOS)
+        if: runner.os == 'macOS'
+        run: sudo ifconfig lo0 alias 127.0.0.5 up
+
+      - name: Build the release binary
+        run: cargo build --release --locked --bin dig-dns
+
+      - name: Resolve the binary path
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            echo "BIN=target/release/dig-dns.exe" >> "$GITHUB_ENV"
+          else
+            echo "BIN=target/release/dig-dns" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install (fresh)
+        run: "\"$BIN\" install --json | tee install-1.json"
+      - name: Fresh install was NOT a reinstall
+        run: grep -q '"reinstalled":false' install-1.json
+
+      - name: Poll until the service reports RUNNING
+        run: |
+          for i in $(seq 1 30); do
+            if "$BIN" status --json | tee status-1.json | grep -q '"serving":true'; then
+              echo "service is serving after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::service never reached RUNNING within 30s"
+          cat status-1.json || true
+          exit 1
+
+      - name: Windows — assert the SCM display name
+        if: runner.os == 'Windows'
+        run: |
+          OUT="$(sc.exe qc net.dignetwork.dig-dns)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "DIG NETWORK: DNS"
+
+      - name: Second install is a clean reinstall (no 1073)
+        run: |
+          "$BIN" install --json | tee install-2.json
+          grep -q '"reinstalled":true' install-2.json
+
+      - name: Poll until RUNNING again (post-reinstall)
+        run: |
+          for i in $(seq 1 30); do
+            if "$BIN" status --json | tee status-2.json | grep -q '"serving":true'; then
+              echo "service is serving after the reinstall (${i}s)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::service never reached RUNNING after the reinstall"
+          cat status-2.json || true
+          exit 1
+
+      - name: Stop
+        run: "\"$BIN\" stop --json"
+
+      - name: Uninstall
+        run: "\"$BIN\" uninstall --json | tee uninstall.json"
+      - name: Assert the service is gone
+        run: |
+          grep -q '"installed":false' uninstall.json
+          "$BIN" status --json | tee status-final.json || true
+          grep -q '"registered":false' status-final.json
