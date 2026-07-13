@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.10.2] - 2026-07-13
+
+### Bug Fixes
+- Generate .deb systemd enable/start scripts + fix msi/deb release smoke tests (#15)
+
 ## [0.10.1] - 2026-07-13
 
 ### Testing
