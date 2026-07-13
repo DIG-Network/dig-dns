@@ -159,9 +159,18 @@ jobs:
           # BLOCKING: uninstall removes the service cleanly.
           $u = Start-Process msiexec.exe -ArgumentList "/x","`"$msi`"","/qn","/norestart" -Wait -PassThru
           if ($u.ExitCode -ne 0) { throw "msiexec /x failed: $($u.ExitCode)" }
-          sc.exe query net.dignetwork.dig-dns 2>$null
-          if ($LASTEXITCODE -eq 0) { throw "service still present after uninstall" }
+          # `sc.exe query` on an absent service exits 1060 ("does not exist") — that non-zero code
+          # IS the "service is gone" signal we want. Capture it into a variable and swallow the
+          # native output so it does NOT leak into $LASTEXITCODE: GitHub's pwsh wrapper ends the
+          # step with `exit $LASTEXITCODE`, so a bare non-zero native call as the last statement
+          # would FAIL the step even though every assertion passed.
+          sc.exe query net.dignetwork.dig-dns 2>$null | Out-Null
+          $serviceGone = ($LASTEXITCODE -ne 0)
+          if (-not $serviceGone) { throw "service still present after uninstall" }
           Write-Host "MSI smoke test PASSED: registered with run-service+auto-start, removed cleanly."
+          # Exit explicitly so a leaked non-zero $LASTEXITCODE from the (intentionally-failing)
+          # absence probe above can never fail an otherwise-passing step.
+          exit 0
 
       # ---------------------------------------------------------------------------------------
       # Linux: build the .deb (cargo-deb) then smoke-test install → verify unit → remove.
@@ -205,10 +214,14 @@ jobs:
           done
           systemctl status net.dignetwork.dig-dns --no-pager || true
           journalctl -u net.dignetwork.dig-dns --no-pager -n 30 || true
-          # BLOCKING: removal stops + deregisters the unit.
-          sudo apt-get remove -y dig-dns
-          if systemctl cat net.dignetwork.dig-dns.service 2>/dev/null; then echo "unit still present after remove"; exit 1; fi
-          echo ".deb smoke test PASSED: unit installed (ExecStart+CAP_NET_BIND_SERVICE), enabled, removed cleanly."
+          # BLOCKING: PURGE stops + fully deregisters the unit, leaving nothing behind. `remove`
+          # alone MASKS the unit (postrm creates /etc/systemd/system/<unit> -> /dev/null, standard
+          # Debian behaviour) so `systemctl cat` would still succeed on the mask; `purge` runs the
+          # postrm purge branch (deb-systemd-helper purge + unmask), removing the mask so the unit
+          # is genuinely gone — the true "clean removal" assertion (matches the .pkg leg's intent).
+          sudo apt-get purge -y dig-dns
+          if systemctl cat net.dignetwork.dig-dns.service 2>/dev/null; then echo "unit still present after purge"; exit 1; fi
+          echo ".deb smoke test PASSED: unit installed (ExecStart+CAP_NET_BIND_SERVICE), enabled, purged cleanly."
 
       # ---------------------------------------------------------------------------------------
       # macOS: build the .pkg (pkgbuild/productbuild) then smoke-test install → verify daemon →
