@@ -40,6 +40,15 @@ and a `.deb` (`cargo-deb` metadata + `packaging/linux/…service`). Durable gotc
   `UpgradeCode` + `<MajorUpgrade>` is what gives clean upgrade/uninstall. Verify a built MSI's tables
   with `wix msi decompile out.msi -o x.wxs` (the COM `WindowsInstaller.Installer` route fights
   PowerShell arg marshalling).
+- **A `.wxs` XML comment MUST NOT contain `--` (WIX0104), and the `.wxs` build is a Windows-only
+  release-job step — so a bad comment escapes the PR gate and only sinks the tag release.** XML
+  forbids `--` inside a comment body (and a body ending in `-`); `wix build` enforces it strictly and
+  refuses to emit the MSI. v0.11.0 shipped a `--browser-policy` mention inside the top comment block,
+  which passed `cargo test`/clippy but failed `build (windows-x64.exe)` at "Build Windows .msi (WiX)",
+  so the tag was created with NO published release (#530). Guard: `tests/wix_manifest_wellformed.rs`
+  parses every comment in `wix/main.wxs` and asserts the two rules in plain `cargo test`, catching it
+  on every OS before the release job runs. When referring to CLI flags in a `.wxs` comment, avoid the
+  literal `--flag` form (write "the browser-policy flag" instead).
 - **`ServiceControl Wait="no"`** so a busy `:53` never wedges `msiexec` — the service reports
   `SERVICE_RUNNING` before its binds then degrades (§13.4/#499), so the installer must not block on
   the service reaching running.

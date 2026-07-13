@@ -19,8 +19,8 @@
   Wires OS-level *.dig resolution (dig_ecosystem #530): deferred custom actions run
   `dig-dns.exe configure-os` on install and `unconfigure-os` on uninstall (as LocalSystem, so the
   NRPT rule can be added), gated on the public property CONFIGURE_OS (default 1; silent-install
-  opt-out `msiexec /i … CONFIGURE_OS=0`). They do NOT pass --browser-policy, so the MSI never puts
-  a browser under managed policy.
+  opt-out `msiexec /i … CONFIGURE_OS=0`). They do NOT set a browser-policy flag, so the MSI never
+  puts a browser under managed policy.
 
   CI builds it with the Cargo version + the dir holding the freshly-built exe:
     wix build wix/main.wxs -arch x64 -d Version=<cargo version> -d BinDir=<dir with dig-dns.exe> -o <out.msi>
