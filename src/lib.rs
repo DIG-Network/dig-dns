@@ -39,6 +39,12 @@
 //! - [`service`] — OS-service registration: the canonical service id (`net.dignetwork.dig-dns`),
 //!   the Windows display name ("DIG NETWORK: DNS"), and the clean-reinstall contract (stop,
 //!   delete, then recreate on an existing service, so a re-run never hits `CreateService 1073`).
+//! - [`service_run`] — the platform-independent SCM run-loop contract (report `RUNNING` BEFORE
+//!   any slow/fallible startup work, so the Windows SCM never times the service out with error
+//!   1053), behind a testable reporter trait.
+//! - [`state`] — the machine-wide, identity-independent service state dir (`%PROGRAMDATA%\DigDns`
+//!   / `/var/lib/dig-dns` / `/Library/Application Support/DigDns`, `DIG_DNS_STATE_DIR` override)
+//!   + the runtime-info file the CLI reads to locate the running service regardless of user.
 //! - [`cli`] — the `dig-dns` binary's command surface (grows per phase).
 //!
 //! `doctor` (Phase 4) + the PAC CLI (Phase 5) land in later phases, composing these modules;
@@ -59,6 +65,8 @@ pub mod node;
 pub mod pac;
 pub mod server;
 pub mod service;
+pub mod service_run;
+pub mod state;
 pub mod transport;
 
 /// The Windows Service Control Protocol entrypoint (Windows only): the `run-service` subcommand

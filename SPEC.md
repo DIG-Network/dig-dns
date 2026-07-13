@@ -487,10 +487,19 @@ port (§7) or the retry loop (§12.1 step 3) keeps trying the same port.
 
 ## 13. OS-service registration
 
-`dig-dns` installs as an auto-starting OS service that runs `dig-dns serve`. The service
-BINARY owns its own registration (the installer invokes `dig-dns install`); registration is
-identical across platforms via the `service-manager` crate (Windows SCM, Linux systemd, macOS
-launchd).
+`dig-dns` installs as an auto-starting OS service that runs the **headless service run mode**
+(§13.4): `dig-dns run-service` on Windows (the SCM-protocol entrypoint), `dig-dns serve` on
+Linux/macOS (systemd/launchd exec the foreground process directly). The `dig-dns` binary owns
+BOTH this run mode AND its registration (via the `service-manager` crate — Windows SCM, Linux
+systemd, macOS launchd).
+
+Registration MUST point the OS service manager at the `dig-dns` binary's OWN run mode — i.e. the
+service program is `dig-dns` with args `run-service` (Windows) / `serve` (elsewhere). A
+registration MUST NOT interpose a separate host process that re-launches `dig-dns` as a child:
+there is exactly ONE service process (`dig-dns` itself), mirroring the sibling `dig-node`
+service. Whichever component performs the registration — the installer, or `dig-dns install` —
+registers this identical program+args under the canonical identity (§13.1), so the two paths are
+interchangeable and idempotent (the clean-reinstall, §13.2, makes a re-run safe).
 
 ### 13.1 Canonical identity
 
@@ -533,11 +542,65 @@ launchd `bootout`/`bootstrap`; Linux systemd `stop`+`disable` then reinstall the
 | `dig-dns install [--node URL]` | Register (clean-reinstall) + start the service; bakes the resolved config into the service environment. Windows requires an elevated console. |
 | `dig-dns uninstall` | Stop + deregister the service. Windows requires elevation. |
 | `dig-dns start` / `dig-dns stop` | Start / stop the registered service. |
-| `dig-dns status` | Report whether the resolver is serving (probes `GET /.dig/resolve-probe` on the bound port) + whether it is registered. Exits non-zero when nothing is serving. |
-| `dig-dns run-service` | (hidden, Windows only) The SCM protocol entrypoint the installed service launches; speaks `StartServiceCtrlDispatcher` so the SCM does not kill it with error 1053. Behaves like `serve` off Windows. |
+| `dig-dns status` | Report whether the resolver is serving (probes `GET /.dig/resolve-probe` on the bound port) + whether it is registered, PLUS the running service's `pid` and ACTUALLY-bound port read from the machine-wide runtime file (§13.5). Exits non-zero when nothing is serving. |
+| `dig-dns run-service` | (hidden, Windows only) The SCM protocol entrypoint the installed service launches; speaks `StartServiceCtrlDispatcher` and reports `SERVICE_RUNNING` before any startup work so the SCM does not kill it with error 1053 (§13.4). Behaves like `serve` off Windows. |
 
 Every command supports `--json` (§10). Install level: user-level (no elevation) on Linux/macOS;
 system-level on Windows (SCM has no per-user services).
+
+### 13.4 Headless run mode & the SCM report-running contract (the 1053 fix)
+
+On Windows, the SCM launches the registered program and expects it to connect
+(`StartServiceCtrlDispatcher`) and report `SERVICE_RUNNING` within the SCM start timeout (~30s).
+Failing to do so is Windows **error 1053** ("the service did not respond … in a timely fashion").
+`dig-dns run-service` is that connection and MUST:
+
+1. **Report `SERVICE_RUNNING` FIRST — before ANY slow or fallible startup work.** Config load,
+   the tokio-runtime build, node-endpoint resolution (§6.3 ladder), and the `:80`/`:53` socket
+   binds all happen AFTER the `RUNNING` signal. No bind, no network probe, and no fallible load
+   may precede it. (The control handler is registered before `RUNNING` only so an immediate
+   `Stop` is not lost; registration is a constant-time SCM call, not startup work.)
+2. **Never hang on bring-up.** The gateway bind uses the deterministic `:8053` fallback (§4.3);
+   the DNS `:53` bind is best-effort (a failure is non-fatal — Path B still serves). If BOTH the
+   primary and fallback gateway binds fail, bring-up fails FAST with a clear error naming both
+   addresses — never a hang.
+3. **Surface a bring-up failure as a clean stop.** A hard failure after `RUNNING` reports
+   `SERVICE_STOPPED` with a non-zero Win32 exit code (so `sc query` reflects it) and returns —
+   never a hang, never a silent success.
+
+This ordering is implemented behind a platform-independent seam (`report RUNNING` → run body →
+`report STOPPED(exit)`) that is unit-tested with a recording status reporter on every platform,
+so the contract holds without a real SCM and cannot silently regress. On Linux/macOS the run
+mode is a plain foreground serve loop shutting down on `SIGTERM`/Ctrl-C (systemd/launchd own the
+lifecycle), so no SCM handshake applies.
+
+### 13.5 Machine-wide state dir & targeting the running service (#501)
+
+The `dig-dns` service runs as a system account (Windows LocalSystem, Linux/macOS root); its CLI
+counterpart (`status`, …) may be invoked by ANY user. So any state the CLI shares with the
+running service lives in a MACHINE-WIDE, identity-independent directory — NEVER a per-user
+profile dir — so the observation/control path does not vary by who runs the CLI (mirroring the
+sibling `dig-node` machine-wide state model):
+
+| OS | Default state dir |
+|----|-------------------|
+| Windows | `%PROGRAMDATA%\DigDns` (typically `C:\ProgramData\DigDns`) |
+| macOS | `/Library/Application Support/DigDns` |
+| Linux | `/var/lib/dig-dns` |
+
+The `DIG_DNS_STATE_DIR` environment variable overrides the default; the service and the CLI both
+honour it, so they always agree. On startup (after binding) the service records a non-secret
+`runtime.json` in this dir — `{ pid, loopback_ip, http_port (the ACTUALLY-bound port, which may
+be the `:8053` fallback), dns_active }` — and removes it on graceful shutdown; the CLI reads it
+to locate + identify the exact running process and its real port regardless of the invoking user.
+Writing is best-effort: a non-admin foreground `dig-dns serve` that cannot write the system dir
+still serves, and the CLI falls back to probing the fixed loopback port.
+
+`dig-dns` holds NO control-token or auth secret (its gateway is loopback-only and
+unauthenticated), so the state dir carries no secret material and `runtime.json` is non-sensitive.
+The installer creates the dir and applies its ACL (SYSTEM + Administrators full control,
+install-user read; Unix `0640`/`0600`); `dig-dns` only RESOLVES the path and best-effort
+reads/writes `runtime.json` within it.
 
 ---
 
@@ -550,3 +613,15 @@ system-level on Windows (SCM has no per-user services).
 | dig-node control RPC (localhost tier) | `127.0.0.1:9778` | HTTP (JSON-RPC) |
 | dig-node `dig.local` tier — dig-node's own best-effort bind, OR `dig-dns`'s ensured reverse proxy (§12) | `127.0.0.2:80` | HTTP |
 | public gateway fallback | `rpc.dig.net:443` | HTTPS |
+
+## Appendix B — machine-wide state dir (§13.5)
+
+| OS | State dir | Runtime file |
+|---|---|---|
+| Windows | `%PROGRAMDATA%\DigDns` (default `C:\ProgramData\DigDns`) | `runtime.json` |
+| macOS | `/Library/Application Support/DigDns` | `runtime.json` |
+| Linux | `/var/lib/dig-dns` | `runtime.json` |
+
+Overridable via `DIG_DNS_STATE_DIR` (honoured by both the service and the CLI). `runtime.json`
+is `{ pid, loopback_ip, http_port, dns_active }` — non-secret; written by the service on startup,
+removed on graceful shutdown, read by the CLI to target the running service regardless of user.
