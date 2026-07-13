@@ -118,6 +118,30 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Configure this machine's DNS resolver so `*.<tld>` names resolve to the local dig-dns
+    /// responder SYSTEM-WIDE (an explicit admin action, distinct from the serve runtime which
+    /// never touches the resolver). Per OS: systemd-resolved/NetworkManager-dnsmasq split-DNS
+    /// (Linux), `/etc/resolver/<tld>` + a boot-persistent `lo0` alias (macOS), an NRPT rule
+    /// (Windows). Idempotent + marker-scoped; needs elevation (root / Administrator).
+    ConfigureOs {
+        /// ALSO set a Chrome/Edge managed policy turning DNS-over-HTTPS off, so those browsers
+        /// honour the OS resolver. Off by default — the native packages never pass it; only an
+        /// explicit admin opts a machine's browsers into a managed policy (Path B / the PAC
+        /// otherwise covers Secure-DNS browsers).
+        #[arg(long)]
+        browser_policy: bool,
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reverse `configure-os`: remove the `*.<tld>` resolver wiring this tool — OR the legacy
+    /// dig-installer — added (marker-scoped; never touches an unmarked rule or an org policy),
+    /// plus any managed browser policy it wrote. Needs elevation.
+    UnconfigureOs {
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Generate the PAC file (Path B) routing `*.<tld>` through the gateway. Uses the actual
     /// bound port: `--port` if given, else the running gateway's port, else the configured port.
     Pac {
@@ -222,7 +246,9 @@ where
         | Command::Uninstall { .. }
         | Command::Start { .. }
         | Command::Stop { .. }
-        | Command::Status { .. } => {
+        | Command::Status { .. }
+        | Command::ConfigureOs { .. }
+        | Command::UnconfigureOs { .. } => {
             Err("this command runs via the binary entrypoint, not execute()".to_string())
         }
     }
@@ -421,6 +447,25 @@ pub fn run() -> std::process::ExitCode {
                 Err(e) => fail(&e.to_string()),
             }
         }
+        Command::ConfigureOs {
+            browser_policy,
+            json,
+        } => {
+            let cfg = match load_config(None) {
+                Ok(c) => c,
+                Err(e) => return fail(&e),
+            };
+            let report = crate::os_config::configure(&cfg, *browser_policy);
+            print_os_config_report(&report, *json)
+        }
+        Command::UnconfigureOs { json } => {
+            let cfg = match load_config(None) {
+                Ok(c) => c,
+                Err(e) => return fail(&e),
+            };
+            let report = crate::os_config::unconfigure(&cfg);
+            print_os_config_report(&report, *json)
+        }
         _ => match execute(&cli, |k| std::env::var(k).ok()) {
             Ok(out) => {
                 println!("{out}");
@@ -428,6 +473,25 @@ pub fn run() -> std::process::ExitCode {
             }
             Err(msg) => fail(&msg),
         },
+    }
+}
+
+/// Print an [`crate::os_config::OsConfigReport`] (`--json` object or human summary) and map its
+/// outcome to an exit code: success when it did its work, failure otherwise (incl. a
+/// not-elevated refusal) so a script/package can branch on the exit status.
+fn print_os_config_report(
+    report: &crate::os_config::OsConfigReport,
+    json: bool,
+) -> std::process::ExitCode {
+    if json {
+        println!("{}", report.to_json());
+    } else {
+        print!("{}", report.summary());
+    }
+    if report.ok {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
     }
 }
 
@@ -583,6 +647,8 @@ mod tests {
             vec!["install"],
             vec!["uninstall"],
             vec!["status"],
+            vec!["configure-os"],
+            vec!["unconfigure-os"],
         ] {
             let err = execute(&cli(&args), no_env).unwrap_err();
             assert!(
@@ -590,6 +656,33 @@ mod tests {
                 "unexpected for {args:?}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn configure_os_parses_the_browser_policy_and_json_flags() {
+        // Default: resolver-only (no browser policy).
+        let plain = cli(&["configure-os"]);
+        assert!(matches!(
+            plain.command,
+            Command::ConfigureOs {
+                browser_policy: false,
+                json: false
+            }
+        ));
+        // Both flags set.
+        let full = cli(&["configure-os", "--browser-policy", "--json"]);
+        assert!(matches!(
+            full.command,
+            Command::ConfigureOs {
+                browser_policy: true,
+                json: true
+            }
+        ));
+        // unconfigure-os takes only --json.
+        assert!(matches!(
+            cli(&["unconfigure-os", "--json"]).command,
+            Command::UnconfigureOs { json: true }
+        ));
     }
 
     #[test]

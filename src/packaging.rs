@@ -290,6 +290,116 @@ mod tests {
         );
     }
 
+    // -- OS resolver configuration hooks (dig_ecosystem #530) -----------------------------------
+
+    #[test]
+    fn deb_postinst_configures_os_after_the_debhelper_systemd_fragments() {
+        // The custom postinst MUST keep the `#DEBHELPER#` token (else cargo-deb's enable/start
+        // systemd fragments are lost — #525 regresses) and then call configure-os, default ON with
+        // the DIG_DNS_SKIP_CONFIGURE_OS opt-out (#530).
+        let postinst = read_normalized("packaging/linux/postinst");
+        // Regression for the #530 smoke failure: cargo-deb substitutes EVERY occurrence of the
+        // debhelper token, so it must appear EXACTLY once (on its own line) — a stray copy in a
+        // comment splices the systemd snippet mid-comment and corrupts the script.
+        assert_eq!(
+            postinst.matches("#DEBHELPER#").count(),
+            1,
+            "postinst must contain the debhelper token exactly once: {postinst}"
+        );
+        assert!(
+            postinst.contains("dig-dns configure-os"),
+            "postinst must wire OS-level *.dig resolution (#530): {postinst}"
+        );
+        assert!(
+            postinst.contains("DIG_DNS_SKIP_CONFIGURE_OS"),
+            "postinst must honour the documented opt-out env (#530): {postinst}"
+        );
+    }
+
+    #[test]
+    fn deb_prerm_unconfigures_on_remove_only_before_debhelper() {
+        // prerm reverses the wiring on `remove` ONLY (never `upgrade`), while /usr/bin/dig-dns
+        // still exists (postrm would be too late), and keeps #DEBHELPER# for the systemd stop.
+        let prerm = read_normalized("packaging/linux/prerm");
+        assert!(prerm.contains("dig-dns unconfigure-os"), "{prerm}");
+        assert!(
+            prerm.contains("remove)"),
+            "must guard on the `remove` action so upgrades don't tear down mid-flight: {prerm}"
+        );
+        assert_eq!(
+            prerm.matches("#DEBHELPER#").count(),
+            1,
+            "prerm must contain the debhelper token exactly once: {prerm}"
+        );
+    }
+
+    #[test]
+    fn deb_postrm_carries_the_debhelper_token() {
+        // postrm is provided explicitly (only the systemd purge/unmask fragment) so the three
+        // maintainer scripts + their #DEBHELPER# merges are deterministic together.
+        let postrm = read_normalized("packaging/linux/postrm");
+        assert_eq!(
+            postrm.matches("#DEBHELPER#").count(),
+            1,
+            "postrm must contain the debhelper token exactly once: {postrm}"
+        );
+    }
+
+    #[test]
+    fn macos_postinstall_wires_os_level_dig_resolution() {
+        // The .pkg postinstall calls configure-os unconditionally (no prompt), best-effort.
+        let post = read_normalized("packaging/macos/scripts/postinstall");
+        assert!(
+            post.contains("/usr/local/bin/dig-dns configure-os"),
+            "macOS postinstall must wire OS-level *.dig resolution (#530): {post}"
+        );
+    }
+
+    #[test]
+    fn macos_uninstaller_reverses_configure_os_before_removing_the_binary() {
+        // The shipped uninstaller must call unconfigure-os FIRST (while the binary exists), then
+        // bootout the daemon + remove the payload.
+        let sh = read_normalized("packaging/macos/uninstall.sh");
+        let unconfigure_at = sh
+            .find("dig-dns unconfigure-os")
+            .expect("uninstaller must reverse configure-os (#530)");
+        let remove_binary_at = sh
+            .find("rm -f /usr/local/bin/dig-dns")
+            .expect("uninstaller must remove the binary");
+        assert!(
+            unconfigure_at < remove_binary_at,
+            "unconfigure-os must run BEFORE the binary is deleted: {sh}"
+        );
+        assert!(
+            sh.contains("bootout system/net.dignetwork.dig-dns"),
+            "uninstaller must bootout the service daemon: {sh}"
+        );
+    }
+
+    #[test]
+    fn wix_wires_configure_os_custom_actions() {
+        let wxs = read_normalized("wix/main.wxs");
+        // A public opt-out property, default ON.
+        assert!(
+            wxs.contains("Id=\"CONFIGURE_OS\"") && wxs.contains("Value=\"1\""),
+            "MSI must expose the CONFIGURE_OS opt-out property (default 1): {wxs}"
+        );
+        // Deferred, non-impersonated exe custom actions running configure-os / unconfigure-os.
+        assert!(wxs.contains("ExeCommand=\"configure-os\""), "{wxs}");
+        assert!(wxs.contains("ExeCommand=\"unconfigure-os\""), "{wxs}");
+        assert!(
+            wxs.contains("Execute=\"deferred\"") && wxs.contains("Impersonate=\"no\""),
+            "custom actions must run as LocalSystem (deferred + no-impersonate) for NRPT: {wxs}"
+        );
+        // Configure on fresh install, unconfigure on a genuine (non-upgrade) uninstall.
+        assert!(wxs.contains("Action=\"DigDnsConfigureOs\""), "{wxs}");
+        assert!(
+            wxs.contains("Action=\"DigDnsUnconfigureOs\"")
+                && wxs.contains("NOT UPGRADINGPRODUCTCODE"),
+            "unconfigure must skip a major-upgrade removal: {wxs}"
+        );
+    }
+
     #[test]
     fn cargo_deb_generates_the_enable_start_maintainer_scripts() {
         // Regression for dig_ecosystem #525: cargo-deb only GENERATES the systemd enable/start

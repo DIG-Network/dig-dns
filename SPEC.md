@@ -246,9 +246,12 @@ the service, not a store).
   general forward-proxy path.
 - **No TLS interception.** `dig-dns` serves plain HTTP on loopback and never terminates or
   man-in-the-middles TLS. `.dig` is an `http://` origin on the local machine.
-- **No hosts-file edits, no OS DNS reconfiguration at runtime.** The runtime MUST NOT modify
-  `/etc/hosts`, `/etc/resolver`, NRPT rules, or any OS resolver configuration. Those are the
-  installer's concern (Component B); the runtime only binds its sockets and answers.
+- **The serve runtime NEVER reconfigures the OS resolver.** The `serve` / `run-service` runtime
+  MUST NOT modify `/etc/hosts`, `/etc/resolver`, systemd-resolved, NRPT rules, or any OS resolver
+  configuration — it only binds its sockets and answers. OS resolver wiring is instead an
+  EXPLICIT, elevated administrator action, `dig-dns configure-os` / `unconfigure-os` (§15),
+  invoked by the native package post-installs or by hand — never a side effect of serving. This
+  keeps the invariant intact: running the resolver never silently edits the machine's DNS.
 - **DNS-rebinding defense.** The gateway MUST reject a request whose host is not a valid
   `<label>.<tld>` (a public domain pointed at `127.0.0.5` is refused), so even though it binds
   loopback it never serves a foreign-named request.
@@ -392,6 +395,8 @@ it exits non-zero if any REQUIRED check fails, and supports `--json` (§6.2). Ch
 - DNS responder answers `<label>.dig` directly at `<loopback_ip>:53` → `127.0.0.5`;
 - OS resolution of `<label>.dig` returns `127.0.0.5` (Path A end-to-end — may be "not
   configured", which is informational unless Path A is the only path);
+- OS resolver config STATE (`os_config`) — whether the `configure-os` (§15) resolver wiring is
+  present on this machine (informational; explains a "configured but a DoH browser bypasses it");
 - gateway `/.dig/resolve-probe` → `204` on the bound port;
 - gateway serves a real `.dig` end-to-end (`/.dig/health` reports node reachable);
 - browser policy state relevant to Path B (DoH / built-in-resolver) — informational;
@@ -557,9 +562,13 @@ launchd `bootout`/`bootstrap`; Linux systemd `stop`+`disable` then reinstall the
 | `dig-dns start` / `dig-dns stop` | Start / stop the registered service. |
 | `dig-dns status` | Report whether the resolver is serving (probes `GET /.dig/resolve-probe` on the bound port) + whether it is registered, PLUS the running service's `pid` and ACTUALLY-bound port read from the machine-wide runtime file (§13.5). Exits non-zero when nothing is serving. |
 | `dig-dns run-service` | (hidden, Windows only) The SCM protocol entrypoint the installed service launches; speaks `StartServiceCtrlDispatcher` and reports `SERVICE_RUNNING` before any startup work so the SCM does not kill it with error 1053 (§13.4). Behaves like `serve` off Windows. |
+| `dig-dns configure-os [--browser-policy]` | Wire OS-level `*.<tld>` resolution so names resolve system-wide (§15). An explicit admin action distinct from the serve runtime; needs elevation (root / Administrator). `--browser-policy` ALSO sets a Chrome/Edge managed DoH-off policy (opt-in; the packages do not pass it). |
+| `dig-dns unconfigure-os` | Reverse `configure-os` (§15): remove the marker-scoped resolver wiring this tool — or the legacy dig-installer — added, plus any managed browser policy it wrote. Needs elevation. |
 
-Every command supports `--json` (§10). Install level: user-level (no elevation) on Linux/macOS;
-system-level on Windows (SCM has no per-user services).
+Every command supports `--json` (§10). Install level for the SERVICE (`install`): user-level (no
+elevation) on Linux/macOS; system-level on Windows. OS resolver configuration (`configure-os`,
+§15) ALWAYS needs elevation on every OS (it edits system resolver state); refusal is reported with
+a stable `needs_elevation: true` JSON field.
 
 ### 13.4 Headless run mode & the SCM report-running contract (the 1053 fix)
 
@@ -623,8 +632,14 @@ reads/writes `runtime.json` within it.
 #503). The `dig-installer` downloads + runs them; it does NOT hand-roll service registration. Each
 package registers the SAME canonical identity (§13.1) running the SAME entrypoint, and creates the
 SAME machine-wide state dir (§13.5), as a manual `dig-dns install` — the packaged and manual paths
-are interchangeable and idempotent. A package installs ONLY the service; `dig-dns` owns `*.dig`
-resolution, so it registers NO OS scheme handler (that is dig-node's job for `chia://`/`urn:dig:chia:`).
+are interchangeable and idempotent. A package registers NO OS scheme handler (`dig-dns` owns `*.dig`
+resolution; scheme handling for `chia://`/`urn:dig:chia:` is dig-node's job).
+
+Beyond registering the service, each package's post-install ALSO runs `dig-dns configure-os` (§15)
+so the package ALONE makes `*.<tld>` resolve system-wide — otherwise `apt install dig-dns` / a bare
+`.msi`/`.pkg` would leave a running service the OS never routes names to (dig_ecosystem #530). This
+is default-ON, cleanly reversible on uninstall, and opt-out per OS (§15.4). The post-install NEVER
+passes `--browser-policy`: a package must not silently place a browser under managed policy.
 
 Per OS the release workflow (`.github/workflows/release.yml`) builds one package on the matching
 runner OS and attaches it to the `vX.Y.Z` GitHub Release alongside the raw binaries.
@@ -648,6 +663,11 @@ runner OS and attaches it to the `vX.Y.Z` GitHub Release alongside the raw binar
   full, installing user READ" requirement; no custom ACL is applied (the dir holds no secret).
 - Adds the install dir to the system `PATH`; a fixed `UpgradeCode` + `MajorUpgrade` gives clean
   in-place upgrade and uninstall.
+- Deferred, non-impersonated (LocalSystem) custom actions run `dig-dns.exe configure-os` after
+  `StartServices` on a fresh install and `unconfigure-os` before `RemoveFiles` on a genuine
+  uninstall (skipped during a major-upgrade removal). Gated on the public property `CONFIGURE_OS`
+  (default `1`; opt out of a silent install with `msiexec /i … CONFIGURE_OS=0`); `Return=ignore`
+  so a resolver-wiring hiccup never fails the (un)install (§15).
 
 ### 14.2 macOS `.pkg`
 
@@ -656,7 +676,11 @@ runner OS and attaches it to the `vX.Y.Z` GitHub Release alongside the raw binar
   `dig-dns serve`.
 - `postinstall` creates `/Library/Application Support/DigDns`, then `launchctl bootstrap system` +
   `launchctl enable` the daemon; `preinstall` `launchctl bootout`s any existing daemon first so an
-  upgrade re-bootstraps cleanly (§13.2).
+  upgrade re-bootstraps cleanly (§13.2). `postinstall` THEN runs `dig-dns configure-os` (§15) —
+  unconditional (a `.pkg` has no opt-out prompt), best-effort.
+- A `.pkg` has no built-in uninstaller, so the package ships `/usr/local/share/dig-dns/uninstall.sh`
+  which runs `dig-dns unconfigure-os` (while the binary still exists), boots out the daemon, and
+  removes the payload + state dir.
 
 ### 14.3 Ubuntu `.deb`
 
@@ -674,6 +698,81 @@ runner OS and attaches it to the `vX.Y.Z` GitHub Release alongside the raw binar
 - Control metadata is apt-correct + stable (`Package: dig-dns`, `Architecture: amd64`, auto-computed
   `Depends`, `Section: net`), so `apt.dig.net` ingests the release-asset `.deb` and GPG-signs it into
   the apt repo (#425).
+- The maintainer scripts (`packaging/linux/{postinst,prerm,postrm}`) each carry the `#DEBHELPER#`
+  token cargo-deb substitutes with its systemd enable/start/stop/purge fragments, and additionally:
+  `postinst` runs `dig-dns configure-os` (§15) after the systemd fragments (default ON; opt out with
+  `DIG_DNS_SKIP_CONFIGURE_OS=1` in the install environment); `prerm` runs `dig-dns unconfigure-os`
+  on the `remove` action ONLY (not `upgrade`), before the binary is deleted. All best-effort.
+
+---
+
+## 15. OS resolver configuration (`configure-os` / `unconfigure-os`)
+
+`configure-os` wires this machine's DNS resolver so `<label>.<tld>` names resolve to the local
+`dig-dns` responder SYSTEM-WIDE; `unconfigure-os` reverses it. This is an EXPLICIT administrator
+action, distinct from the serve runtime (§5 invariant: the runtime never edits the resolver). It is
+what makes a bare package install actually resolve `*.<tld>`, and it is the single implementation
+both the native packages (§14) and — in future — the `dig-installer` call, replacing the installer's
+own duplicated per-OS logic.
+
+### 15.1 Per-OS artifacts (the RESOLVER wiring — always applied)
+
+| OS | Artifact | Content |
+|----|----------|---------|
+| Linux (systemd-resolved) | `/etc/systemd/resolved.conf.d/dig.conf` | `[Resolve]` `DNS=<ip>` `Domains=~<tld>`, then `systemctl reload-or-restart systemd-resolved` + `resolvectl flush-caches` |
+| Linux (NetworkManager-dnsmasq) | `/etc/NetworkManager/dnsmasq.d/dig.conf` | `server=/<tld>/<ip>`, then `systemctl reload NetworkManager` |
+| macOS | boot-persistent `lo0` alias LaunchDaemon `/Library/LaunchDaemons/net.dignetwork.dig-dns-lo0.plist` + live `ifconfig lo0 alias <ip> up` + `/etc/resolver/<tld>` (`nameserver <ip>`) + `dscacheutil -flushcache` & `killall -HUP mDNSResponder` | — |
+| Windows | NRPT rule `Add-DnsClientNrptRule -Namespace .<tld> -NameServers <ip>` | — |
+
+The default `<ip>`/`<tld>` are `127.0.0.5` / `dig` (§7); both follow the resolved config.
+
+- **Linux resolver detection.** The owning resolver is DETECTED, never assumed: systemd-resolved
+  when `/etc/resolv.conf` symlinks into `systemd`, else NetworkManager-dnsmasq when its drop-in
+  directory exists, else Unknown — in which case a plain `/etc/resolv.conf` is left UNTOUCHED and
+  browsers reach `*.<tld>` via Path B (the PAC).
+- **The macOS `lo0` alias is a FUNCTIONAL PREREQUISITE, not optional.** macOS answers only
+  `127.0.0.1` on `lo0` by default — the responder's `127.0.0.5` is unreachable without an explicit
+  alias, which macOS also drops on reboot. `configure-os` therefore applies the alias immediately
+  AND installs a one-shot boot LaunchDaemon that re-applies it every boot.
+
+### 15.2 The browser managed-DoH policy is opt-in (`--browser-policy`)
+
+Setting a Chrome/Edge *managed policy* (`DnsOverHttpsMode=off` + `BuiltInDnsClientEnabled=false`,
+so those browsers honour the OS resolver) is invasive and is applied ONLY with `--browser-policy`.
+The native packages do NOT pass it. It never clobbers a pre-existing org policy (a key/plist without
+this tool's marker is left alone). Its artifacts: Linux uniquely-named files
+`/etc/opt/{chrome,chromium}/policies/managed/dig-dns.json`; macOS
+`/Library/Managed Preferences/com.google.Chrome.plist` (only when no MDM policy exists); Windows
+`HKLM\SOFTWARE\Policies\{Google\Chrome,Microsoft\Edge}` values + a `DigDnsManaged` marker.
+
+### 15.3 The DoH-browser caveat
+
+Even with `configure-os`, a browser with **Secure DNS / DNS-over-HTTPS** (Brave, Chrome, Edge, …)
+resolves names via its own encrypted upstream and BYPASSES the OS resolver — so `*.<tld>` will not
+resolve there via Path A. Such a browser still needs EITHER Path B (point its proxy at the PAC file,
+`http://<ip>:<port>/.dig/proxy.pac`, §4.7) OR its DoH turned off (`--browser-policy`, or manually).
+`configure-os` alone does not solve DoH browsers; that is expected.
+
+### 15.4 Idempotency, marker-scoping, legacy migration, opt-out
+
+- **Idempotent.** Re-running `configure-os` is a no-op-equivalent (content is written only when it
+  differs; the NRPT add is self-guarded).
+- **Marker-scoped.** Every artifact carries the marker `managed by dig-dns configure-os` (or is a
+  uniquely-named file this tool solely owns). `unconfigure-os` removes ONLY marked artifacts — plus
+  those left by the OLD dig-installer (marker `managed by dig-installer (dig-dns, task #177)`, and
+  the legacy unmarked `/etc/resolver/<tld>` `nameserver <ip>` file) so previously-wired machines
+  clean up. A `.<tld>` rule / org policy this tool did not write is NEVER touched.
+- **Elevation.** Both subcommands need OS privilege (root / Administrator); a non-elevated
+  invocation is REFUSED with a clear message and `needs_elevation: true` in `--json`, never a
+  cryptic failure inside a system tool.
+- **Package opt-out.** `.deb`: env `DIG_DNS_SKIP_CONFIGURE_OS=1`. `.msi`: public property
+  `CONFIGURE_OS=0`. `.pkg`: unconditional (no prompt), reversible via the shipped `uninstall.sh`.
+
+### 15.5 `doctor` awareness
+
+`doctor` (§9) reports an informational `os_config` check — whether the `configure-os` (or legacy)
+resolver wiring is present on this machine — so a "configured but a DoH browser bypasses it" state
+is diagnosable. It never changes the pass/fail outcome (Path B can carry traffic without it).
 
 ---
 

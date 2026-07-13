@@ -213,3 +213,37 @@ independent, so a `:53` bind failure (unprivileged run, or `:53` already held) i
 `DIG_DNS_IP=127.0.0.1` + high `DIG_DNS_DNS_PORT`/`DIG_DNS_HTTP_PORT`. (Do NOT smoke-test `serve`
 by backgrounding it from the Bash tool on Windows — the process is not reaped and hangs the
 shell; the socket integration tests are the real evidence.)
+
+## `configure-os`: OS resolver wiring is an explicit admin action, cfg-free, marker-scoped (#530)
+
+Listening is not resolving: `dig-dns install` / the native packages make the responder *listen*,
+but the OS still has to be told to ROUTE `*.dig` to `127.0.0.5`. That is `configure-os`
+(`src/os_config.rs`), deliberately SEPARATE from the serve runtime — the §5 invariant "the serve
+runtime never edits the OS resolver" stays intact; only an explicit elevated subcommand does.
+
+- **No `#[cfg]` gating.** Like `doctor.rs`, the module compiles on every target and branches on
+  `std::env::consts::OS` at runtime. All the OS-specific work is Command spawns / file writes
+  (`systemctl`/`resolvectl`/`ifconfig`/`launchctl`/`powershell`/`reg`), so NO Windows-only crate
+  (no `winreg`) is needed — the Windows browser policy uses `reg.exe` argv. Keeps the whole surface
+  unit-testable everywhere: the pure builders (drop-in/plist/NRPT/reg content, `ResolvOwner`,
+  `content_is_ours`) are the tested core; the thin apply layer is exercised by the Linux
+  `configure-os-smoke` CI (the one leg with a live systemd-resolved) + the macOS/Windows package
+  smokes in `release.yml`.
+- **macOS `lo0` alias is a FUNCTIONAL PREREQUISITE, not optional.** macOS answers only `127.0.0.1`
+  on `lo0` (unlike Linux/Windows 127/8), and drops aliases on reboot — so `configure-os` applies
+  `127.0.0.5` immediately AND installs a one-shot boot LaunchDaemon (`…-lo0.plist`) to re-apply it.
+  Without the alias the responder is simply unreachable (same root cause as `service.rs`'s
+  macOS-probe hang note).
+- **Marker-scoped + legacy-aware.** Every artifact carries `managed by dig-dns configure-os`;
+  `unconfigure-os` removes only those, PLUS the legacy dig-installer marker
+  `managed by dig-installer (dig-dns, task #177)` and the legacy UNMARKED `/etc/resolver/dig`
+  bare-`nameserver` file — so installer-wired machines migrate. Never touches an unmarked rule/org
+  policy. The `dig-installer` will later DROP its `src/dns/*` and call this (a follow-up unit).
+- **Packages call it default-ON, opt-out per OS:** `.deb` `postinst` (env `DIG_DNS_SKIP_CONFIGURE_OS=1`,
+  keeps `#DEBHELPER#` so cargo-deb still enables/starts the unit — #525); `.deb` `prerm` reverses on
+  the `remove` action ONLY (before the binary is gone — postrm would be too late); `.msi` deferred
+  LocalSystem custom actions (property `CONFIGURE_OS=0`); `.pkg` unconditional + ships
+  `/usr/local/share/dig-dns/uninstall.sh`. Never passes `--browser-policy` (a package must not put a
+  browser under managed policy silently).
+- **DoH caveat:** a Secure-DNS browser bypasses the OS resolver regardless, so it still needs Path B
+  (the PAC) or DoH-off — `configure-os` alone cannot fix that.

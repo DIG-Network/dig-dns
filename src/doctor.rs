@@ -267,6 +267,38 @@ pub fn evaluate_gateway(primary: u16, fallback: u16, answered_port: Option<u16>)
     }
 }
 
+/// Evaluate the OS-resolver configuration STATE (SPEC §15): whether `configure-os` (or the legacy
+/// installer) has wired `*.<tld>` on this machine. Informational — it never changes the outcome
+/// (Path B can carry traffic without it), but it explains a `.dig`-won't-load with "OS routing
+/// configured but the browser bypasses it via DoH". `None` ⇒ the state was not determined on this
+/// OS (e.g. Windows NRPT, covered by the `os_routing` end-to-end probe instead).
+pub fn evaluate_os_config(present: Option<bool>) -> Check {
+    match present {
+        Some(true) => Check::new(
+            "os_config",
+            "OS resolver configured for .dig (configure-os)",
+            CheckStatus::Info,
+            "the OS-level *.dig resolver wiring is present".to_string(),
+        ),
+        Some(false) => Check::new(
+            "os_config",
+            "OS resolver configured for .dig (configure-os)",
+            CheckStatus::Info,
+            "no OS-level *.dig resolver wiring found".to_string(),
+        )
+        .with_fix(
+            "run `dig-dns configure-os` (as root/Administrator) to route *.dig system-wide, \
+             or rely on Path B (the PAC proxy)",
+        ),
+        None => Check::new(
+            "os_config",
+            "OS resolver configured for .dig (configure-os)",
+            CheckStatus::Info,
+            "not determined on this OS (see the end-to-end OS routing check)".to_string(),
+        ),
+    }
+}
+
 /// Evaluate the content link: can the gateway reach a dig-node?
 pub fn evaluate_node(reachable: Option<bool>) -> Check {
     match reachable {
@@ -314,6 +346,10 @@ pub async fn run(config: &Config) -> Report {
     // 3) OS routing (Path A end-to-end).
     let resolved = probe_os_routing(&config.tld).await;
     checks.push(evaluate_os_routing(ip, &resolved));
+
+    // 3b) OS-resolver config STATE (SPEC §15) — is the `configure-os` wiring present? Informational;
+    // explains a Path A configured-but-bypassed (browser DoH) case.
+    checks.push(evaluate_os_config(crate::os_config::is_configured(config)));
 
     // 4) gateway port (Path B).
     let http = build_probe_client();
@@ -622,6 +658,18 @@ mod tests {
         assert_eq!(evaluate_node(Some(true)).status, CheckStatus::Pass);
         assert_eq!(evaluate_node(Some(false)).status, CheckStatus::Warn);
         assert_eq!(evaluate_node(None).status, CheckStatus::Info);
+    }
+
+    #[test]
+    fn os_config_evaluator_is_always_informational() {
+        // Present, absent, and undetermined are all Info (never gate the outcome), but only the
+        // "absent" case offers the configure-os fix hint.
+        assert_eq!(evaluate_os_config(Some(true)).status, CheckStatus::Info);
+        assert!(evaluate_os_config(Some(true)).fix.is_none());
+        let absent = evaluate_os_config(Some(false));
+        assert_eq!(absent.status, CheckStatus::Info);
+        assert!(absent.fix.as_deref().unwrap().contains("configure-os"));
+        assert_eq!(evaluate_os_config(None).status, CheckStatus::Info);
     }
 
     /// A representative dev-machine report: loopback up, DNS + gateway answering, OS routing not
