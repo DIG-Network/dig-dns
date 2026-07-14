@@ -100,8 +100,11 @@ The PAC CLI + README + per-OS acceptance scripts (Phase 5) land next.
 **Config** is defaults + environment overrides (see `SPEC.md §7`): `DIG_DNS_IP`,
 `DIG_DNS_DNS_PORT`, `DIG_DNS_HTTP_PORT`, `DIG_DNS_HTTP_FALLBACK_PORT`, `DIG_DNS_TLD`,
 `DIG_DNS_TTL`, `DIG_NODE_URL` (node endpoint override; empty ⇒ the
-`dig.local → localhost:9778 → rpc.dig.net` ladder), and `DIG_DNS_LOCAL_IP`/`DIG_DNS_LOCAL_PORT`
-(the ensured `dig.local` reverse-proxy address, default `127.0.0.2:80`, SPEC §12).
+`dig.local → localhost:9778 → rpc.dig.net` ladder), `DIG_DNS_LOCAL_IP`/`DIG_DNS_LOCAL_PORT`
+(the ensured `dig.local` reverse-proxy address, default `127.0.0.2:80`, SPEC §12), and
+`DIG_DNS_SECURE_UPSTREAM` (`on`/`off`, default `on` — routes the `rpc.dig.net` lookup through
+the encrypted Mullvad DoH → Mullvad DoT → Quad9 DoT chain, SPEC §6.4; `dig-dns doctor` reports
+which tier answered as the `secure_upstream` check).
 
 ## Installing as an OS service
 

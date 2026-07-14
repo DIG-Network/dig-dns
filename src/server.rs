@@ -404,11 +404,20 @@ pub async fn ensure_dig_local_mapping(
     // with_base}` make, so this function is correct even when called before `run_service`'s own
     // (also-present) `init_crypto()` call, e.g. directly from a test.
     crate::transport::init_crypto();
-    let http = match reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(30))
-        .build()
-    {
+        .timeout(Duration::from_secs(30));
+    // `dig.local`'s target is always the LOCAL node (`dig_local::local_node_target` never
+    // yields `rpc.dig.net`), so wiring the encrypted resolver here is a no-op in practice — it
+    // only ever declines to intercept "localhost"/a local override and defers to the OS
+    // resolver, at no added latency. Wired anyway for a single consistent client-builder story
+    // across the crate (dig_ecosystem #574).
+    let built =
+        crate::transport::with_secure_upstream(builder, config.secure_upstream).and_then(|b| {
+            b.build()
+                .map_err(|e| crate::node::NodeError::Transport(e.to_string()))
+        });
+    let http = match built {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "dig.local: failed to build HTTP client");
@@ -614,6 +623,12 @@ fn proxy_text(status: u16, msg: &str) -> Response<Full<Bytes>> {
 /// primary then the fallback, returning the first that answers `204`. Used by `dig-dns pac` to
 /// emit a PAC file advertising the real bound port (which may be the `:8053` fallback). Returns
 /// `None` when no gateway is running.
+///
+/// Not wired to [`crate::secure_dns::SecureResolver`] (dig_ecosystem #574): `ip` here is always
+/// a loopback IP LITERAL (`config.loopback_ip`), and a literal never triggers ANY DNS resolver —
+/// hyper-util short-circuits straight to the address (confirmed against the vendored
+/// `hyper-util` connector). Wiring a resolver a literal-IP client can never invoke would be dead
+/// weight with no behavior to show for it.
 pub async fn probe_gateway_port(ip: Ipv4Addr, primary: u16, fallback: u16) -> Option<u16> {
     crate::transport::init_crypto();
     let http = reqwest::Client::builder()

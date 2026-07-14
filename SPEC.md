@@ -332,6 +332,44 @@ served only for a **public store whose module is locally cached**; `dig-dns` MUS
 on it for correctness (it uses the decoy/decrypt-fail + extension heuristic of §4.5 instead).
 It MAY use it opportunistically to answer `/.dig/`-style introspection.
 
+### 6.4 Upstream resolution security
+
+`rpc.dig.net` (§6.3 tier 4) is the ONE public name `dig-dns` ever asks the network to resolve —
+`dig.local` and `localhost` are local names needing no public DNS. When `DIG_DNS_SECURE_UPSTREAM`
+is `on` (the default), that single lookup is routed through an encrypted chain instead of the
+plain OS resolver, so a local network resolver can neither observe nor tamper with it. This is
+NON-INVASIVE: it changes nothing about the `.dig` responder (§5), the OS/browser configuration
+(§15), or any other name resolution `dig-dns` performs.
+
+**Chain, strict try-order, each provider dialed IPv6-first:**
+
+1. **Mullvad DoH** — `[2a07:e340::2]` then `194.242.2.2`, TLS name `dns.mullvad.net`,
+   `https://dns.mullvad.net/dns-query`.
+2. **Mullvad DoT** — the same IPs, port 853.
+3. **Quad9 unfiltered DoT** — `[2620:fe::10]` then `9.9.9.10`, TLS name `dns10.quad9.net`.
+4. **The OS stub resolver** — a terminal availability net, used ONLY for this one lookup.
+
+A tier is skipped on ANY failure (timeout, refusal, malformed answer) and the NEXT tier is
+tried; the OS resolver is used only when all three encrypted tiers failed. Bootstrap is static
+provider IPs + TLS **hostname** verification against the webpki root store (`tls_dns_name`) —
+NEVER a leaf-certificate pin, so a provider's routine leaf rotation can never brick resolution.
+Resolver responses are cached per the resolution engine's defaults, respecting each answer's TTL
+for the life of the process.
+
+Tier 4 does not violate a never-plaintext guarantee: `rpc.dig.net`'s own TLS connection is
+authenticated by webpki regardless of how its address was learned (a spoofed answer cannot pass
+certificate validation), so falling back to the OS resolver only costs confidentiality of the
+*lookup*, never integrity of the *connection* — and it is what lets a DoH/DoT-blocking network
+(common on some corporate/hotel networks) still reach the public gateway.
+
+**Every other name is untouched, at no added latency.** The encrypted chain applies ONLY to the
+`rpc.dig.net` lookup; a `reqwest` client built with this resolver still resolves `dig.local`,
+`localhost`, and any loopback IP literal exactly as it always has — those never reach the chain.
+
+`doctor --json` reports a `secure_upstream` check: `pass` names which encrypted tier answered;
+`warn` (`degraded`) means every encrypted tier failed and the OS-resolver net was used; `info`
+means the feature is toggled off. See §9 and §7.
+
 ---
 
 ## 7. Configuration
@@ -350,6 +388,7 @@ endpoint, a CLI flag). Values are validated on load; an invalid value is a start
 | node endpoint override | (ladder) | `DIG_NODE_URL` | empty ⇒ use the §6.3 ladder |
 | `dig.local` bind IP | `127.0.0.2` | `DIG_DNS_LOCAL_IP` | MUST be `127.0.0.0/8`; matches the installer's `dig.local` hosts registration (#91) and dig-node's own best-effort bind (§12) |
 | `dig.local` bind port | `80` | `DIG_DNS_LOCAL_PORT` | `http://dig.local` has no port suffix, so this MUST stay `80` in production; overridable for unprivileged local testing (§12) |
+| encrypted upstream resolution | `on` | `DIG_DNS_SECURE_UPSTREAM` | `on`/`off`; routes the `rpc.dig.net` lookup (§6.4) through the Mullvad DoH → Mullvad DoT → Quad9 DoT → OS-resolver chain; `off` restores the OS resolver unconditionally |
 
 ---
 
@@ -400,7 +439,10 @@ it exits non-zero if any REQUIRED check fails, and supports `--json` (§6.2). Ch
 - gateway `/.dig/resolve-probe` → `204` on the bound port;
 - gateway serves a real `.dig` end-to-end (`/.dig/health` reports node reachable);
 - browser policy state relevant to Path B (DoH / built-in-resolver) — informational;
-- who holds `:80` (informational; explains an `:8053` fallback).
+- who holds `:80` (informational; explains an `:8053` fallback);
+- `secure_upstream` (§6.4) — which encrypted tier answered dig-dns's OWN `rpc.dig.net` lookup
+  (`pass`), that every encrypted tier failed and the OS-resolver net was used (`warn`/degraded),
+  a hard resolution failure (`fail`), or the feature is toggled off (`info`).
 
 At least one of {Path A end-to-end, Path B (PAC + gateway)} passing means a `.dig` URL loads;
 `doctor` MUST make clear which path(s) are live.

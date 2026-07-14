@@ -10,7 +10,7 @@
 # root and increase on every PR (CLAUDE.md §2.4 / §3.6).
 [package]
 name = "dig-dns"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 description = "Local *.dig name resolution: a DNS responder + HTTP gateway resolving <storeId>.dig to DIG store content via a dig-node."
 license = "GPL-2.0-only"
@@ -142,6 +142,21 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # target the way dig-node's already does. `dig-dns install` registers the service; the
 # clean-reinstall (stop → delete → recreate) lives in `src/service.rs`.
 service-manager = "0.7"
+# Encrypted upstream DNS for dig-dns's OWN outbound lookups (dig_ecosystem #574) — the ONE
+# public name it ever resolves is `rpc.dig.net` (SPEC §6.3's terminal ladder tier); this crate
+# supplies the actual DoH/DoT protocol engine so `src/secure_dns.rs` never hand-rolls it.
+# `tls-ring`/`https-ring` pick the same **ring** crypto backend as the `rustls` dependency above
+# (no aws-lc-rs/C-toolchain requirement); `webpki-roots` gives hostname-verified TLS against the
+# Mozilla root store — deliberately NOT leaf-cert pinning (a provider's leaf rotates; a pin would
+# brick resolution on rotation). `system-config` is left OFF: dig-dns never reads the OS
+# resolver's own configuration, only uses the OS resolver as the tier-4 availability net via
+# plain `tokio::net::lookup_host`.
+hickory-resolver = { version = "0.26.1", default-features = false, features = [
+    "tokio",
+    "tls-ring",
+    "https-ring",
+    "webpki-roots",
+] }
 
 # Windows Service Control Protocol. service-manager only REGISTERS the service in the SCM; the
 # executable the SCM launches must itself speak the service protocol (StartServiceCtrlDispatcher)

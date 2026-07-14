@@ -130,6 +130,13 @@ All settings have defaults and are environment-overridable (`SPEC.md §7`):
 | browsable TLD | `DIG_DNS_TLD` | `dig` |
 | DNS answer TTL (s) | `DIG_DNS_TTL` | `2` |
 | dig-node endpoint override | `DIG_NODE_URL` (or `--node`) | ladder |
+| encrypted upstream resolution (`SPEC.md §6.4`) | `DIG_DNS_SECURE_UPSTREAM` | `on` |
+
+The `rpc.dig.net` lookup — the ONE public name `dig-dns` ever resolves — goes through an
+encrypted Mullvad DoH → Mullvad DoT → Quad9 DoT chain by default, falling back to the OS
+resolver only if all three are unreachable. Nothing else changes: `dig.local`/`localhost`/the
+`.dig` responder are untouched. Set `DIG_DNS_SECURE_UPSTREAM=off` to use the OS resolver
+unconditionally, as before this feature shipped.
 
 ```sh
 # Example: run unprivileged on 127.0.0.1 with a custom TLD + node
@@ -150,6 +157,7 @@ DIG_DNS_IP=127.0.0.1 DIG_DNS_HTTP_PORT=8080 DIG_DNS_DNS_PORT=5353 DIG_DNS_TLD=we
 | `node_reachable` | gateway is up but no dig-node reachable → content 502s | start your dig-node (`localhost:9778`) or set `--node`/`DIG_NODE_URL` |
 | `browser_doh` | browser may auto-enable DoH, bypassing Path A | point the browser at the PAC (Path B) — the installer sets the managed policy |
 | `port80_holder` | another process holds `:80` | free `:80`, or keep the `:8053` fallback + PAC |
+| `secure_upstream` | every encrypted DNS tier failed for the `rpc.dig.net` lookup (degraded — the OS resolver answered instead) | check whether this network blocks DoH/DoT (common on some corporate/hotel networks) |
 
 A `.dig` URL loads iff `loopback_ip` is up AND at least one of Path A (`os_routing`) or Path B
 (`gateway_port`) is live. `doctor` exits non-zero otherwise.
