@@ -1,0 +1,321 @@
+# The ONE place dig-dns's cross-OS build lives. It is a REUSABLE workflow (`on: workflow_call`
+# only — it never fires on its own): both release paths call it, so the OS/arch matrix + the
+# native-package builds are defined exactly once (DRY, CLAUDE.md §2.5):
+#
+#   * release.yml          — the STABLE `vX.Y.Z` tag builder, and
+#   * nightly-release.yml   — the NIGHTLY pre-release channel.
+#
+# The caller passes the version string stamped into each artifact's filename and, optionally, the
+# git ref to build. The job builds BOTH the self-contained `dig-dns` binary AND the NATIVE OS
+# install packages (Windows `.msi`, macOS `.pkg`, Ubuntu `.deb`) for every supported OS/arch, plus
+# the `digd` first-class alias binary (dig_ecosystem #548). The native packages install dig-dns AS
+# A SERVICE (#503); the Ubuntu `.deb` is also ingested + GPG-signed into the apt repo by
+# apt.dig.net (#425).
+#
+# dig-dns is a lean, pure-Rust binary (rustls TLS, no OpenSSL / wasmtime), so every target builds
+# without a cross C-toolchain. Canonical asset stems: `dig-dns-<ver>-<os-arch>[.exe|.msi|.pkg]`,
+# `digd-<ver>-<os-arch>[.exe]`, and the Debian-conventional `dig-dns_<ver>_amd64.deb`.
+#
+# The gate runs fmt + clippy only — a PR's own CI (ci.yml) already ran the full
+# fmt/clippy/test/coverage set against the merged tree before merge (§2.4a); re-running the suite
+# on the release path is redundant flake-exposure that has blocked releases before (#489/#488).
+name: Build binaries (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version string stamped into each artifact filename (e.g. `1.2.3` or `1.2.3-nightly.20260714.abc1234`)."
+        type: string
+        required: true
+      ref:
+        description: "Git ref (tag / branch / SHA) to check out and build. Empty = the caller run's commit."
+        type: string
+        required: false
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+
+jobs:
+  # Gate: fmt + clippy only. The merged tree already passed the full release-gate suite on the PR
+  # before merge (§2.4a); this is a fast sanity check that the tree still builds. See header.
+  check:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Install Rust (stable + components)
+        run: |
+          rustup toolchain install stable --component rustfmt --component clippy
+          rustup default stable
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  build:
+    name: build (${{ matrix.out_name }})
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: dig-dns.exe
+            out_name: windows-x64.exe
+            arch: x64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: dig-dns
+            out_name: linux-x64
+            arch: x64
+          - os: macos-14 # Apple silicon (arm64)
+            target: aarch64-apple-darwin
+            bin: dig-dns
+            out_name: macos-arm64
+            arch: arm64
+          - os: macos-14 # Apple silicon — cross-compiles the Intel binary
+            target: x86_64-apple-darwin
+            bin: dig-dns
+            out_name: macos-x64
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Install Rust + target
+        shell: bash
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # The caller's `version` is stamped into filenames verbatim ($VER): a plain `1.2.3` for a
+      # stable tag, or the synthesized `1.2.3-nightly.YYYYMMDD.<shortsha>` for a nightly. Native OS
+      # package formats (MSI ProductVersion, .pkg version) require a NUMERIC `x.y.z` version, so
+      # $PKG_VER strips any semver-prerelease/build suffix for the package metadata while $VER keeps
+      # the full string for raw-binary asset filenames. (For a stable tag the two are identical.)
+      - name: Resolve version
+        shell: bash
+        run: |
+          VER="${{ inputs.version }}"
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          echo "PKG_VER=${VER%%-*}" >> "$GITHUB_ENV"
+          echo "Building version $VER (package version ${VER%%-*})"
+
+      - name: Build release binaries (dig-dns + the digd alias)
+        # Build BOTH bins — `digd` is the first-class alias (dig_ecosystem #548), published as its
+        # own raw-binary asset alongside `dig-dns` below. Building both here also lets cargo-deb
+        # (default assets = all bins) package them together for the .deb leg.
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-dns --bin digd
+
+      - name: Stage raw binaries (dig-dns + digd)
+        shell: bash
+        run: |
+          mkdir -p dist
+          SRC="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          test -f "$SRC" || { echo "binary not produced: $SRC"; exit 1; }
+          cp "$SRC" "dist/dig-dns-${VER}-${{ matrix.out_name }}"
+          # The `digd` alias binary sits beside `dig-dns` (the bin name differs only by the
+          # `dig-dns`->`digd` substring, incl. the `.exe` suffix on Windows). Published under the
+          # `digd-<ver>-<os_arch>` stem so the dig-installer resolves it exactly as it does `digs`.
+          DIGD_BIN="${{ matrix.bin }}"; DIGD_BIN="${DIGD_BIN/dig-dns/digd}"
+          DIGD_SRC="target/${{ matrix.target }}/release/${DIGD_BIN}"
+          test -f "$DIGD_SRC" || { echo "digd binary not produced: $DIGD_SRC"; exit 1; }
+          cp "$DIGD_SRC" "dist/digd-${VER}-${{ matrix.out_name }}"
+          ls -la dist
+
+      # ---------------------------------------------------------------------------------------
+      # Windows: build the .msi (WiX) then smoke-test install → verify service → uninstall.
+      # ---------------------------------------------------------------------------------------
+      - name: Build Windows .msi (WiX)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
+          $bindir = "target/${{ matrix.target }}/release"
+          $out = "dist/dig-dns-$env:VER-windows-x64.msi"
+          # MSI ProductVersion must be numeric x.y.z — use $PKG_VER (a nightly's prerelease suffix
+          # is not a valid MSI version); the filename keeps the full $VER for traceability.
+          wix build wix/main.wxs -arch ${{ matrix.arch }} -d Version=$env:PKG_VER -d "BinDir=$bindir" -o $out
+          if (-not (Test-Path $out)) { throw "MSI not produced: $out" }
+          Get-ChildItem dist
+
+      - name: Smoke-test the .msi (install → verify service → uninstall)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem "dist/*.msi")[0].FullName
+          Write-Host "Installing $msi"
+          $p = Start-Process msiexec.exe -ArgumentList "/i","`"$msi`"","/qn","/norestart","/l*v","install.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content install.log -Tail 60; throw "msiexec /i failed: $($p.ExitCode)" }
+          # BLOCKING: the service must be registered with the canonical identity + `run-service`
+          # entrypoint + auto-start.
+          $qc = (sc.exe qc net.dignetwork.dig-dns | Out-String)
+          Write-Host $qc
+          if ($qc -notmatch 'run-service')   { throw "service ImagePath missing run-service" }
+          if ($qc -notmatch 'AUTO_START')    { throw "service is not auto-start" }
+          if ($qc -notmatch 'DIG NETWORK: DNS') { throw "display name not set" }
+          if (-not (Test-Path "$env:ProgramData\DigDns")) { throw "C:\ProgramData\DigDns not created" }
+          # INFORMATIVE: whether it reached RUNNING (the service reports RUNNING before its binds,
+          # but a busy :53/:80 on the runner could still degrade it) — logged, not release-blocking.
+          $state = (sc.exe query net.dignetwork.dig-dns | Out-String)
+          Write-Host "Service state:`n$state"
+          # BLOCKING: uninstall removes the service cleanly.
+          $u = Start-Process msiexec.exe -ArgumentList "/x","`"$msi`"","/qn","/norestart" -Wait -PassThru
+          if ($u.ExitCode -ne 0) { throw "msiexec /x failed: $($u.ExitCode)" }
+          # `sc.exe query` on an absent service exits 1060 ("does not exist") — that non-zero code
+          # IS the "service is gone" signal we want. Capture it into a variable and swallow the
+          # native output so it does NOT leak into $LASTEXITCODE: GitHub's pwsh wrapper ends the
+          # step with `exit $LASTEXITCODE`, so a bare non-zero native call as the last statement
+          # would FAIL the step even though every assertion passed.
+          sc.exe query net.dignetwork.dig-dns 2>$null | Out-Null
+          $serviceGone = ($LASTEXITCODE -ne 0)
+          if (-not $serviceGone) { throw "service still present after uninstall" }
+          Write-Host "MSI smoke test PASSED: registered with run-service+auto-start, removed cleanly."
+          # Exit explicitly so a leaked non-zero $LASTEXITCODE from the (intentionally-failing)
+          # absence probe above can never fail an otherwise-passing step.
+          exit 0
+
+      # ---------------------------------------------------------------------------------------
+      # Linux: build the .deb (cargo-deb) then smoke-test install → verify unit → remove.
+      # The .deb is an apt-correct release asset apt.dig.net ingests + GPG-signs (#425).
+      # ---------------------------------------------------------------------------------------
+      - name: Build Ubuntu .deb (cargo-deb)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          cargo install cargo-deb --locked
+          # --no-build: reuse the release binary already built above (same target). cargo-deb writes
+          # the apt-conventional `dig-dns_<ver>_amd64.deb` to target/<target>/debian/ (version read
+          # from Cargo.toml, so nightly .debs carry the base x.y.z — acceptable for the pre-release).
+          cargo deb --no-build --target ${{ matrix.target }}
+          cp target/${{ matrix.target }}/debian/*.deb dist/
+          echo "=== .deb control metadata ==="
+          DEB=$(ls dist/*.deb)
+          dpkg-deb -I "$DEB"
+          echo "=== .deb contents ==="
+          dpkg-deb -c "$DEB"
+
+      - name: Smoke-test the .deb (install → verify unit → remove)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -eo pipefail
+          DEB=$(ls dist/*.deb)
+          echo "Installing $DEB"
+          sudo apt-get update -qq || true
+          sudo apt-get install -y "./$DEB"
+          # BLOCKING: the unit is installed with the correct ExecStart + capability + enabled.
+          UNIT=$(systemctl cat net.dignetwork.dig-dns.service)
+          echo "$UNIT"
+          echo "$UNIT" | grep -q 'ExecStart=/usr/bin/dig-dns serve'      || { echo "bad ExecStart"; exit 1; }
+          echo "$UNIT" | grep -q 'AmbientCapabilities=CAP_NET_BIND_SERVICE' || { echo "missing CAP_NET_BIND_SERVICE"; exit 1; }
+          test -x /usr/bin/dig-dns                                         || { echo "binary not on PATH"; exit 1; }
+          systemctl is-enabled net.dignetwork.dig-dns                      || { echo "not enabled"; exit 1; }
+          # INFORMATIVE: whether it reached active (loopback bind on the runner may vary) — logged.
+          for i in $(seq 1 10); do
+            if systemctl is-active --quiet net.dignetwork.dig-dns; then echo "service ACTIVE"; break; fi
+            sleep 1
+          done
+          systemctl status net.dignetwork.dig-dns --no-pager || true
+          journalctl -u net.dignetwork.dig-dns --no-pager -n 30 || true
+          # #530: the postinst runs `dig-dns configure-os`. On this systemd-resolved runner it wires
+          # /etc/systemd/resolved.conf.d/dig.conf; record whether it did so we can assert prerm/purge
+          # removes it (zero residue). Conditional so a differently-configured runner never flakes.
+          DROPIN=/etc/systemd/resolved.conf.d/dig.conf
+          if [ -f "$DROPIN" ]; then
+            echo "postinst configure-os wired systemd-resolved ($DROPIN)"; WIRED=1
+          else
+            echo "(no systemd-resolved drop-in — resolver owner may differ on this runner; informational)"; WIRED=0
+          fi
+          # BLOCKING: PURGE stops + fully deregisters the unit, leaving nothing behind. `remove`
+          # alone MASKS the unit (postrm creates /etc/systemd/system/<unit> -> /dev/null, standard
+          # Debian behaviour) so `systemctl cat` would still succeed on the mask; `purge` runs the
+          # postrm purge branch (deb-systemd-helper purge + unmask), removing the mask so the unit
+          # is genuinely gone — the true "clean removal" assertion (matches the .pkg leg's intent).
+          sudo apt-get purge -y dig-dns
+          if systemctl cat net.dignetwork.dig-dns.service 2>/dev/null; then echo "unit still present after purge"; exit 1; fi
+          # #530: prerm ran `dig-dns unconfigure-os` before the binary was removed — the configure-os
+          # drop-in must be gone (zero residue).
+          if [ "$WIRED" = 1 ] && [ -e "$DROPIN" ]; then
+            echo "configure-os drop-in left behind after purge (prerm unconfigure-os failed) (#530)"; exit 1
+          fi
+          echo ".deb smoke test PASSED: unit installed (ExecStart+CAP_NET_BIND_SERVICE), enabled, configure-os wired + reversed, purged cleanly."
+
+      # ---------------------------------------------------------------------------------------
+      # macOS: build the .pkg (pkgbuild/productbuild) then smoke-test install → verify daemon →
+      # uninstall (manual bootout + payload removal — a .pkg has no built-in uninstaller).
+      # ---------------------------------------------------------------------------------------
+      - name: Build macOS .pkg (pkgbuild/productbuild)
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          set -eo pipefail
+          PAYLOAD="pkgroot"
+          rm -rf "$PAYLOAD"
+          mkdir -p "$PAYLOAD/usr/local/bin" "$PAYLOAD/Library/LaunchDaemons" "$PAYLOAD/usr/local/share/dig-dns"
+          cp "target/${{ matrix.target }}/release/dig-dns" "$PAYLOAD/usr/local/bin/dig-dns"
+          chmod 755 "$PAYLOAD/usr/local/bin/dig-dns"
+          cp packaging/macos/net.dignetwork.dig-dns.plist "$PAYLOAD/Library/LaunchDaemons/"
+          chmod 644 "$PAYLOAD/Library/LaunchDaemons/net.dignetwork.dig-dns.plist"
+          # Ship the uninstaller (a .pkg has no built-in one) — reverses configure-os + removes the
+          # payload (dig_ecosystem #530).
+          cp packaging/macos/uninstall.sh "$PAYLOAD/usr/local/share/dig-dns/uninstall.sh"
+          chmod 755 "$PAYLOAD/usr/local/share/dig-dns/uninstall.sh"
+          chmod 755 packaging/macos/scripts/preinstall packaging/macos/scripts/postinstall
+          # pkgbuild --version must be numeric x.y.z — use $PKG_VER (nightly suffix stripped); the
+          # productbuild output filename keeps the full $VER for traceability.
+          pkgbuild --root "$PAYLOAD" \
+                   --identifier net.dignetwork.dig-dns \
+                   --version "$PKG_VER" \
+                   --scripts packaging/macos/scripts \
+                   --install-location / \
+                   "component.pkg"
+          productbuild --package "component.pkg" "dist/dig-dns-${VER}-${{ matrix.out_name }}.pkg"
+          ls -la dist
+
+      - name: Smoke-test the .pkg (install → verify daemon → uninstall)
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          set -eo pipefail
+          PKG=$(ls dist/*.pkg)
+          echo "Installing $PKG"
+          sudo installer -pkg "$PKG" -target / -verbose
+          # BLOCKING: the payload + plist + uninstaller are installed.
+          test -x /usr/local/bin/dig-dns                                        || { echo "binary not installed"; exit 1; }
+          test -f /Library/LaunchDaemons/net.dignetwork.dig-dns.plist           || { echo "plist not installed"; exit 1; }
+          test -d "/Library/Application Support/DigDns"                         || { echo "state dir not created"; exit 1; }
+          test -x /usr/local/share/dig-dns/uninstall.sh                         || { echo "uninstaller not installed (#530)"; exit 1; }
+          # INFORMATIVE: whether launchd bootstrapped/started it, and whether postinstall's
+          # configure-os wired /etc/resolver/dig + the lo0 alias (#530) — logged, not blocking.
+          sudo launchctl print system/net.dignetwork.dig-dns || echo "(daemon not printable — informational)"
+          test -f /etc/resolver/dig && echo "configure-os wrote /etc/resolver/dig" || echo "(no /etc/resolver/dig — informational)"
+          ifconfig lo0 | grep -q 127.0.0.5 && echo "configure-os aliased 127.0.0.5 on lo0" || echo "(no lo0 alias — informational)"
+          # BLOCKING: the shipped uninstaller reverses configure-os + removes the payload cleanly.
+          sudo /usr/local/share/dig-dns/uninstall.sh
+          if sudo launchctl print system/net.dignetwork.dig-dns 2>/dev/null; then echo "daemon still present after uninstall"; exit 1; fi
+          test -e /etc/resolver/dig && { echo "/etc/resolver/dig left behind after uninstall (#530)"; exit 1; } || true
+          echo ".pkg smoke test PASSED: binary+plist+uninstaller installed, configure-os wired, uninstalled cleanly."
+
+      - name: Upload build artifacts (binary + native package)
+        uses: actions/upload-artifact@v4
+        with:
+          name: dig-dns-${{ matrix.out_name }}
+          path: dist/*
+          if-no-files-found: error
