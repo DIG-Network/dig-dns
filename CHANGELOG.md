@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.12.0] - 2026-07-14
+
+### Features
+- **cli:** Digd first-class alias binary for dig-dns (mirror digs #434) (#18)
+
 ## [0.11.1] - 2026-07-13
 
 ### Bug Fixes
