@@ -10,7 +10,7 @@
 # so it MUST live at the root and increase on every PR (CLAUDE.md §2.4 / §3.6).
 [package]
 name = "dig-dns"
-version = "0.13.1"
+version = "0.13.2"
 edition = "2021"
 description = "Local *.dig name resolution: a DNS responder + HTTP gateway resolving <storeId>.dig to DIG store content via a dig-node."
 license = "GPL-2.0-only"
