@@ -22,6 +22,25 @@ The OS calls sit behind the `service::ServiceBackend` trait so the reinstall ORD
 against a recording mock whose `create` re-raises 1073 when the service still appears installed —
 CI never registers a real service (`sc create` needs elevation + mutates the machine).
 
+## `digd` — the first-class alias binary (dig_ecosystem #548)
+
+`digd` is a second `[[bin]]` target (`src/bin/digd.rs`) that shares the SINGLE entrypoint
+`dig_dns::cli::run()` with `dig-dns` — no duplicated logic; `digd <args>` == `dig-dns <args>`,
+including every service verb. Mirrors digstore's `digs` alias (#434). Durable gotchas:
+
+- **Each binary must show its OWN name in `--help`/`--version`.** clap can't derive this from the
+  shared lib, so `run()` parses via `Cli::command().name(bin).bin_name(bin).get_matches()` where
+  `bin = invoked_bin_name()` (the arg0 file-stem, `.exe` stripped). `Cli::command().name()` needs a
+  `'static` str, so the tiny stem is `Box::leak`ed once (process-lifetime, never in a loop). Without
+  this, `digd --version` would print the hardcoded `dig-dns`.
+- **cargo-deb's default assets include EVERY `[[bin]]`.** Adding `digd` means `cargo deb --no-build`
+  now needs BOTH binaries present in `target/release/`, so every step that builds-for-deb (release.yml
+  build leg + ci.yml `deb-hooks-smoke`) must `cargo build ... --bin dig-dns --bin digd`. As a bonus the
+  `.deb` then ships both on PATH, like digstore's apt tarball ships `digstore` + `digs`.
+- **The MSI/`.pkg` payloads are unaffected** — they harvest `dig-dns.exe` / `dig-dns` explicitly, so
+  building the extra bin doesn't leak `digd` into the service installer (it ships only as its own raw
+  release asset `digd-<ver>-<os_arch>[.exe]`, the shape the dig-installer will later resolve like `digs`).
+
 ## Native install packages (#503): one manifest source, tested to the constants
 
 dig-dns ships an `.msi` (WiX `wix/main.wxs`), a `.pkg` (`packaging/macos` + `pkgbuild`/`productbuild`),
