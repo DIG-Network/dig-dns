@@ -239,24 +239,23 @@ asset that `apt.dig.net` ingests + GPG-signs into the apt repo (#425).
 
 ## Deployment / release
 
-Tag-driven, per CLAUDE.md §3.6:
+Releases are **NOT cut on merge to `main`**. They are batched via a **nightly cron at midnight UTC**
+plus **manual dispatch**. See `runbooks/release.md` for the full pipeline: stable (batched or on
+demand when `Cargo.toml` version is bumped) and nightly (pre-release, every night from `main` HEAD).
 
-1. A PR to `main` bumps `[package].version` in `Cargo.toml` and passes the CI gate set
-   (Rustfmt, Clippy, Test + coverage ≥80%, Build, Lint commit messages, Check version
-   increment).
-2. On merge to `main`, `.github/workflows/changelog-tag.yml` regenerates `CHANGELOG.md` with
-   git-cliff, commits it (`chore(release): vX.Y.Z`), and pushes the `vX.Y.Z` tag — using
-   `secrets.RELEASE_TOKEN` (a classic PAT) so the tag triggers the deploy-on-tag workflow and
-   the changelog commit is allowed past branch protection.
-3. The pushed tag fires `.github/workflows/release.yml`, which builds the `dig-dns` binary for
-   windows-x64 / linux-x64 / macos-arm64 / macos-x64 AND the native install packages (the Windows
-   `.msi`, the two macOS `.pkg`s, the Ubuntu `.deb`), smoke-tests each on its runner OS
-   (install → verify service registered → uninstall), and attaches them all to a GitHub Release.
+The nightly system orchestrates both channels via `.github/workflows/nightly-release.yml`:
+- **Stable** (`vX.Y.Z`): cut automatically at the next midnight when a new version is detected
+  (existing `vX.Y.Z` tag means idempotent no-op), or manually via **Actions → Nightly + stable
+  release → Run workflow → `channel: stable`**. Rebuilds CHANGELOG.md, commits `chore(release):
+  vX.Y.Z`, tags, and fires `.github/workflows/release.yml` to build binaries + native packages
+  (Windows `.msi`, two macOS `.pkg`s, Ubuntu `.deb`) and publish the stable GitHub Release.
+- **Nightly**: built every night from `main` as a pre-release under a rolling tag; kept for 14
+  nights.
 
-**Secrets:** `RELEASE_TOKEN` (repo or org secret) is REQUIRED for the tag-on-merge release to
-fire. **Verify a release:** confirm the `vX.Y.Z` tag exists, the `Release dig-dns` run is green,
-and the GitHub Release has the four binaries + the native packages (`.msi`, `.pkg` ×2, `.deb`)
-attached. The `.deb` is picked up + GPG-signed into the apt repo by `apt.dig.net` (#425).
+**Secrets:** `RELEASE_TOKEN` (repo or org secret, the ecosystem-wide release PAT) is required for
+both channels (no-ops with a warning if absent). **Verify a release:** per `runbooks/release.md`
+→ **Verify a release went live** (GitHub Release with binaries + packages, tag exists, correct
+channel/prerelease marker).
 
 **Test coverage split (#503, #502):** three tiers, each proving a different registration path —
 

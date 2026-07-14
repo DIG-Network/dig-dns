@@ -5,9 +5,9 @@
 # unit-testable) and the service binary (`dig-dns`, a thin CLI shell over the library).
 #
 # The RELEASE version is `[package].version` at the root manifest — the version-increment
-# gate (.github/workflows/ensure-version-increment.yml) and the tag-on-merge release
-# (.github/workflows/changelog-tag.yml) both read it from here, so it MUST live at the
-# root and increase on every PR (CLAUDE.md §2.4 / §3.6).
+# gate (.github/workflows/ensure-version-increment.yml) and the stable release workflow
+# (.github/workflows/nightly-release.yml, a nightly cron + manual dispatch) read it from here,
+# so it MUST live at the root and increase on every PR (CLAUDE.md §2.4 / §3.6).
 [package]
 name = "dig-dns"
 version = "0.13.1"
