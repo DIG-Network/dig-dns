@@ -285,9 +285,27 @@ fn init_tracing() {
 }
 
 /// Parse argv, run the command, print the result, and return the process exit code.
+///
+/// Argv is parsed with the ACTUAL invoked binary name ([`crate::invoked_bin_name`]) as BOTH the
+/// displayed program name and the usage `bin_name`, so the `digd` alias (dig_ecosystem #548) is
+/// first-class: `digd --help` reads `digd` and `dig-dns --help` reads `dig-dns`, from ONE shared
+/// codepath. `get_matches()` still intercepts `--help`/`--version` and exits on a parse error,
+/// using that name.
 pub fn run() -> std::process::ExitCode {
+    use clap::{CommandFactory, FromArgMatches};
     use std::process::ExitCode;
-    let cli = Cli::parse();
+
+    // `Command::name` requires a `'static` string, but the invoked name is computed at runtime,
+    // so we leak the tiny stem to obtain a `'static` reference. This is a single, process-lifetime
+    // allocation on a short-lived CLI's entrypoint — never in a loop — so it is not a meaningful
+    // leak. (`bin_name` takes the owned `String` directly.)
+    let bin = crate::invoked_bin_name();
+    let bin_static: &'static str = Box::leak(bin.clone().into_boxed_str());
+    let matches = Cli::command().name(bin_static).bin_name(bin).get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(c) => c,
+        Err(e) => e.exit(),
+    };
     match &cli.command {
         Command::Serve { node } => {
             init_tracing();

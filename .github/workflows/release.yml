@@ -109,16 +109,26 @@ jobs:
           echo "VER=$VER" >> "$GITHUB_ENV"
           echo "Building version $VER"
 
-      - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-dns
+      - name: Build release binaries (dig-dns + the digd alias)
+        # Build BOTH bins — `digd` is the first-class alias (dig_ecosystem #548), published as its
+        # own raw-binary asset alongside `dig-dns` below. Building both here also lets cargo-deb
+        # (default assets = all bins) package them together for the .deb leg.
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-dns --bin digd
 
-      - name: Stage raw binary
+      - name: Stage raw binaries (dig-dns + digd)
         shell: bash
         run: |
           mkdir -p dist
           SRC="target/${{ matrix.target }}/release/${{ matrix.bin }}"
           test -f "$SRC" || { echo "binary not produced: $SRC"; exit 1; }
           cp "$SRC" "dist/dig-dns-${VER}-${{ matrix.out_name }}"
+          # The `digd` alias binary sits beside `dig-dns` (the bin name differs only by the
+          # `dig-dns`->`digd` substring, incl. the `.exe` suffix on Windows). Published under the
+          # `digd-<ver>-<os_arch>` stem so the dig-installer resolves it exactly as it does `digs`.
+          DIGD_BIN="${{ matrix.bin }}"; DIGD_BIN="${DIGD_BIN/dig-dns/digd}"
+          DIGD_SRC="target/${{ matrix.target }}/release/${DIGD_BIN}"
+          test -f "$DIGD_SRC" || { echo "digd binary not produced: $DIGD_SRC"; exit 1; }
+          cp "$DIGD_SRC" "dist/digd-${VER}-${{ matrix.out_name }}"
           ls -la dist
 
       # ---------------------------------------------------------------------------------------

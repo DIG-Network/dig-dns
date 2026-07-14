@@ -111,6 +111,12 @@ dig-dns doctor [--json]
 dig-dns pac [--port <PORT>] [--json]
 ```
 
+**`digd` — the short alias.** Every install also ships `digd`, a first-class alias binary for
+`dig-dns`: `digd <args>` behaves identically to `dig-dns <args>` (the same subcommands — including
+the service verbs `install`/`uninstall`/`start`/`stop`/`status`/`serve` — flags, `--json`, and
+help). It is a real binary, not a shell alias, so `digd doctor`, `digd install`, etc. all work. Each
+binary reports its own name in `--help`/`--version`. (This mirrors `digs` for `digstore`.)
+
 ## Configuration — change the IP / ports / TLD
 
 All settings have defaults and are environment-overridable (`SPEC.md §7`):

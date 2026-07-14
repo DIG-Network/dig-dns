@@ -287,9 +287,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: deb-hooks-smoke
-      - name: Build the release binary + .deb
+      - name: Build the release binaries + .deb
+        # Build BOTH bins: `digd` is the first-class alias (dig_ecosystem #548) and cargo-deb's
+        # default assets include every `[[bin]]`, so `cargo deb --no-build` needs both present.
         run: |
-          cargo build --release --locked --bin dig-dns
+          cargo build --release --locked --bin dig-dns --bin digd
           cargo install cargo-deb --locked
           cargo deb --no-build
       - name: Install the .deb, assert enable/start + configure-os, then remove with zero residue

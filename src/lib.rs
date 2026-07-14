@@ -81,3 +81,20 @@ pub mod transport;
 /// the installed service launches so it speaks the SCM protocol (avoids error 1053).
 #[cfg(windows)]
 pub mod win_service;
+
+/// The file-stem of the binary as it was invoked (arg0), e.g. `dig-dns` or `digd`
+/// (dig_ecosystem #548 — the `digd` alias). Any directory prefix and the extension
+/// (`.exe` on Windows) are stripped, so a `/usr/bin/digd` or `C:\...\digd.exe` invocation
+/// both yield `"digd"`. This is what the CLI reports as its program name in `--help`/
+/// `--version`, making the alias first-class (each binary shows its own name rather than a
+/// hardcoded `"dig-dns"`). Falls back to `"dig-dns"` when arg0 is somehow absent/empty.
+pub fn invoked_bin_name() -> String {
+    std::env::args_os()
+        .next()
+        .as_deref()
+        .map(std::path::Path::new)
+        .and_then(std::path::Path::file_stem)
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "dig-dns".to_string())
+}

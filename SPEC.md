@@ -570,6 +570,16 @@ elevation) on Linux/macOS; system-level on Windows. OS resolver configuration (`
 §15) ALWAYS needs elevation on every OS (it edits system resolver state); refusal is reported with
 a stable `needs_elevation: true` JSON field.
 
+**The `digd` alias binary (dig_ecosystem #548).** The crate builds a SECOND binary, `digd`, that
+is a first-class alias for `dig-dns`: `digd <args>` MUST behave identically to `dig-dns <args>` —
+the SAME command surface (every command above, including all service verbs), flags, `--json`
+output, and exit codes. Both binaries share the SINGLE entrypoint `dig_dns::cli::run()` (no
+duplicated logic); each parses argv with its OWN invoked name (arg0 file-stem) as the program +
+usage name, so `digd --help`/`--version` read `digd` and `dig-dns --help`/`--version` read
+`dig-dns`. The release publishes `digd-<ver>-<os_arch>[.exe]` alongside
+`dig-dns-<ver>-<os_arch>[.exe]` in the SAME release (byte-for-byte the same asset shape). This
+mirrors how `digs` is the first-class alias for `digstore` (digstore #434).
+
 ### 13.4 Headless run mode & the SCM report-running contract (the 1053 fix)
 
 On Windows, the SCM launches the registered program and expects it to connect
