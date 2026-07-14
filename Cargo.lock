@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "dig-dns"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -795,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "ff"
-version = "0.13.1"
+version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0b50bfb653653f9ca9095b427bed08ab8d75a137839d9ad64eb11810d5b6393"
 dependencies = [
