@@ -42,6 +42,9 @@
 //! - [`pac`] — Proxy Auto-Config generation for Path B (the PAC control endpoint + CLI).
 //! - [`config`] — service configuration: loopback IP / ports / TLD / node endpoint,
 //!   with flag → env → file override precedence.
+//! - [`secure_dns`] — encrypted upstream resolution for dig-dns's OWN `rpc.dig.net` lookup
+//!   (SPEC §6.4): the Mullvad DoH → Mullvad DoT → Quad9 DoT → OS-resolver chain, scoped so
+//!   every other name (`dig.local`, `localhost`, a loopback probe IP) is untouched.
 //! - [`service`] — OS-service registration: the canonical service id (`net.dignetwork.dig-dns`),
 //!   the Windows display name ("DIG NETWORK: DNS"), and the clean-reinstall contract (stop,
 //!   delete, then recreate on an existing service, so a re-run never hits `CreateService 1073`).
@@ -71,6 +74,7 @@ pub mod node;
 pub mod os_config;
 pub mod pac;
 pub mod packaging;
+pub mod secure_dns;
 pub mod server;
 pub mod service;
 pub mod service_run;

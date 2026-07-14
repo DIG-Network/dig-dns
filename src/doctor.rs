@@ -18,6 +18,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::config::Config;
+use crate::secure_dns::Tier;
 
 /// A single diagnostic check's status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -326,6 +327,52 @@ pub fn evaluate_node(reachable: Option<bool>) -> Check {
     }
 }
 
+/// Evaluate the `secure_upstream` check (SPEC §6.4, dig_ecosystem #574): whether dig-dns's OWN
+/// `rpc.dig.net` lookup went through the encrypted chain, which tier answered, or whether the
+/// feature is toggled off. `tier` is `Some` when an encrypted tier answered (Pass), `None` when
+/// the OS-resolver availability net had to be used instead — a DEGRADED result (Warn): the
+/// lookup was not end-to-end encrypted, though `rpc.dig.net`'s own TLS connection is still
+/// webpki-authenticated regardless of how its address was learned. `error` overrides both when
+/// resolution failed outright (every encrypted tier AND the OS resolver).
+pub fn evaluate_secure_upstream(enabled: bool, tier: Option<Tier>, error: Option<&str>) -> Check {
+    if !enabled {
+        return Check::new(
+            "secure_upstream",
+            "Encrypted upstream resolution (rpc.dig.net)",
+            CheckStatus::Info,
+            "disabled by config (DIG_DNS_SECURE_UPSTREAM=off) - the OS resolver is used, as before"
+                .to_string(),
+        );
+    }
+    match (tier, error) {
+        (_, Some(reason)) => Check::new(
+            "secure_upstream",
+            "Encrypted upstream resolution (rpc.dig.net)",
+            CheckStatus::Fail,
+            format!("resolution failed: {reason}"),
+        )
+        .with_fix(
+            "check network connectivity - Mullvad/Quad9 DoH/DoT and the OS resolver were all unreachable",
+        ),
+        (Some(tier), None) => Check::new(
+            "secure_upstream",
+            "Encrypted upstream resolution (rpc.dig.net)",
+            CheckStatus::Pass,
+            format!("answered by {tier} (encrypted)"),
+        ),
+        (None, None) => Check::new(
+            "secure_upstream",
+            "Encrypted upstream resolution (rpc.dig.net)",
+            CheckStatus::Warn,
+            "degraded: every encrypted tier (Mullvad DoH/DoT, Quad9 DoT) failed - fell back to \
+             the OS resolver (the lookup itself was plaintext; the rpc.dig.net connection it \
+             enables is still TLS-authenticated)"
+                .to_string(),
+        )
+        .with_fix("check whether this network blocks DoH/DoT (common on some corporate/hotel networks)"),
+    }
+}
+
 // --- Live probes (async) -------------------------------------------------------------------
 
 /// Run all checks against the live system and build the report.
@@ -373,16 +420,41 @@ pub async fn run(config: &Config) -> Report {
     // 7) who holds :80 (informational - explains an :8053 fallback).
     checks.push(check_port_holder(config.http_port, answered_port));
 
+    // 8) encrypted upstream resolution for dig-dns's OWN rpc.dig.net lookup (SPEC §6.4,
+    // dig_ecosystem #574) - which tier answered, degraded, or off-by-config.
+    checks.push(probe_secure_upstream(config).await);
+
     Report::build(checks)
 }
 
-/// A short-timeout HTTP client for the gateway probes.
+/// A short-timeout HTTP client for the gateway probes. `ip` is always the configured LOOPBACK
+/// address (a literal, never a hostname), so this is intentionally not wired to
+/// [`crate::secure_dns::SecureResolver`] — a literal-IP client never invokes ANY DNS resolver
+/// (see the identical note on `server::probe_gateway_port`); the `secure_upstream` check below
+/// covers the ONE lookup this module needs to actually probe.
 fn build_probe_client() -> reqwest::Client {
     crate::transport::init_crypto();
     reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .unwrap_or_default()
+}
+
+/// Live-probe the `secure_upstream` check: resolve [`crate::secure_dns::UPSTREAM_HOST`] through
+/// the same encrypted chain the transport uses, and report which tier answered.
+async fn probe_secure_upstream(config: &Config) -> Check {
+    if !config.secure_upstream {
+        return evaluate_secure_upstream(false, None, None);
+    }
+    crate::transport::init_crypto();
+    let resolver = match crate::secure_dns::SecureResolver::new() {
+        Ok(resolver) => resolver,
+        Err(e) => return evaluate_secure_upstream(true, None, Some(&e.to_string())),
+    };
+    match crate::secure_dns::resolve_scoped(&resolver, crate::secure_dns::UPSTREAM_HOST).await {
+        Ok((tier, _addrs)) => evaluate_secure_upstream(true, tier, None),
+        Err(e) => evaluate_secure_upstream(true, None, Some(&e.to_string())),
+    }
 }
 
 /// Query the DNS responder directly for a sample `.dig` name; return the first A address.
@@ -672,6 +744,35 @@ mod tests {
         assert_eq!(evaluate_os_config(None).status, CheckStatus::Info);
     }
 
+    #[test]
+    fn secure_upstream_evaluator_off_by_config_is_informational() {
+        let c = evaluate_secure_upstream(false, None, None);
+        assert_eq!(c.status, CheckStatus::Info);
+        assert!(c.detail.contains("off"));
+    }
+
+    #[test]
+    fn secure_upstream_evaluator_passes_when_an_encrypted_tier_answered() {
+        let c = evaluate_secure_upstream(true, Some(Tier::MullvadDoh), None);
+        assert_eq!(c.status, CheckStatus::Pass);
+        assert!(c.detail.contains("Mullvad DoH"));
+    }
+
+    #[test]
+    fn secure_upstream_evaluator_warns_degraded_when_only_the_os_resolver_answered() {
+        let c = evaluate_secure_upstream(true, None, None);
+        assert_eq!(c.status, CheckStatus::Warn);
+        assert!(c.detail.contains("degraded"));
+        assert!(c.fix.is_some());
+    }
+
+    #[test]
+    fn secure_upstream_evaluator_fails_when_resolution_errors_outright() {
+        let c = evaluate_secure_upstream(true, None, Some("timeout"));
+        assert_eq!(c.status, CheckStatus::Fail);
+        assert!(c.detail.contains("timeout"));
+    }
+
     /// A representative dev-machine report: loopback up, DNS + gateway answering, OS routing not
     /// configured (Path B only), node reachable.
     fn dev_checks() -> Vec<Check> {
@@ -749,5 +850,18 @@ mod tests {
         assert_eq!(check_port_holder(80, Some(80)).status, CheckStatus::Info);
         assert_eq!(check_port_holder(80, Some(8053)).status, CheckStatus::Info);
         assert_eq!(check_port_holder(80, None).status, CheckStatus::Info);
+    }
+
+    #[tokio::test]
+    async fn probe_secure_upstream_off_by_config_never_touches_the_network() {
+        // secure_upstream=false short-circuits before any resolver is built or dialed — this
+        // must hold even fully offline (dig_ecosystem #574's toggle-off = prior behavior).
+        let cfg = Config {
+            secure_upstream: false,
+            ..Config::default()
+        };
+        let c = probe_secure_upstream(&cfg).await;
+        assert_eq!(c.id, "secure_upstream");
+        assert_eq!(c.status, CheckStatus::Info);
     }
 }

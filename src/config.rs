@@ -1,5 +1,6 @@
 //! Service configuration: the loopback bind IP, the DNS + HTTP ports, the TLD, the DNS
-//! answer TTL, and the optional dig-node endpoint override.
+//! answer TTL, the optional dig-node endpoint override, and the encrypted-upstream toggle
+//! (SPEC §6.4).
 //!
 //! Every value has a documented default and is overridable by environment variable (and,
 //! for the node endpoint, by a CLI flag with the §5.3 precedence). Values are validated on
@@ -55,6 +56,13 @@ pub const ENV_DNS_TTL: &str = "DIG_DNS_TTL";
 pub const ENV_DIG_LOCAL_IP: &str = "DIG_DNS_LOCAL_IP";
 /// Environment variable for the `dig.local` reverse-proxy bind port (SPEC §12).
 pub const ENV_DIG_LOCAL_PORT: &str = "DIG_DNS_LOCAL_PORT";
+/// Environment variable toggling encrypted upstream resolution for dig-dns's OWN `rpc.dig.net`
+/// lookup (SPEC §6.4, dig_ecosystem #574): `on` (the default) routes it through the Mullvad
+/// DoH → Mullvad DoT → Quad9 DoT chain, falling back to the OS resolver only as a last-resort
+/// availability net; `off` restores the prior behavior (the OS resolver, unconditionally) for
+/// every lookup. Never touches the `.dig` responder itself (SPEC §5) — only this one outbound
+/// lookup dig-dns's own client ever makes.
+pub const ENV_SECURE_UPSTREAM: &str = "DIG_DNS_SECURE_UPSTREAM";
 
 /// A fully-resolved, validated `dig-dns` configuration.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -80,6 +88,10 @@ pub struct Config {
     /// The bind port for the `dig.local` reverse proxy (SPEC §12). `http://dig.local` has no
     /// port suffix, so this MUST stay `80` in production.
     pub dig_local_port: u16,
+    /// Whether dig-dns's own `rpc.dig.net` lookup is routed through the encrypted upstream
+    /// chain (SPEC §6.4, dig_ecosystem #574). `true` (the default) is the Mullvad DoH → Mullvad
+    /// DoT → Quad9 DoT → OS-resolver ladder; `false` restores the OS resolver unconditionally.
+    pub secure_upstream: bool,
 }
 
 /// Errors from building/validating a [`Config`].
@@ -100,6 +112,9 @@ pub enum ConfigError {
     /// The TLD normalised to an empty string.
     #[error("TLD must not be empty")]
     EmptyTld,
+    /// [`ENV_SECURE_UPSTREAM`] was set to neither `on` nor `off`.
+    #[error("DIG_DNS_SECURE_UPSTREAM: '{0}' is not 'on' or 'off'")]
+    InvalidToggle(String),
 }
 
 impl Default for Config {
@@ -114,6 +129,7 @@ impl Default for Config {
             node_url: None,
             dig_local_ip: DEFAULT_DIG_LOCAL_IP,
             dig_local_port: DEFAULT_DIG_LOCAL_PORT,
+            secure_upstream: true,
         }
     }
 }
@@ -181,6 +197,15 @@ fn parse_port(key: &'static str, value: &str) -> Result<u16, ConfigError> {
     }
 }
 
+/// Parse [`ENV_SECURE_UPSTREAM`]'s `on`/`off` value (trimmed, case-insensitive).
+fn parse_secure_upstream(value: &str) -> Result<bool, ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(ConfigError::InvalidToggle(value.to_string())),
+    }
+}
+
 /// Build a validated [`Config`] from an injected environment getter, layering any set
 /// variables over the defaults. Fails if a set value is malformed or violates an invariant.
 pub fn from_env<F>(get: F) -> Result<Config, ConfigError>
@@ -224,6 +249,9 @@ where
     if let Some(v) = get(ENV_DIG_LOCAL_PORT) {
         cfg.dig_local_port = parse_port(ENV_DIG_LOCAL_PORT, &v)?;
     }
+    if let Some(v) = get(ENV_SECURE_UPSTREAM) {
+        cfg.secure_upstream = parse_secure_upstream(&v)?;
+    }
 
     cfg.validate()?;
     Ok(cfg)
@@ -255,6 +283,10 @@ mod tests {
         assert_eq!(c.node_url, None);
         assert_eq!(c.dig_local_ip, Ipv4Addr::new(127, 0, 0, 2));
         assert_eq!(c.dig_local_port, 80);
+        assert!(
+            c.secure_upstream,
+            "encrypted upstream resolution defaults ON (dig_ecosystem #574)"
+        );
         assert!(c.validate().is_ok());
     }
 
@@ -276,6 +308,7 @@ mod tests {
             (ENV_NODE_URL, "http://127.0.0.1:9778"),
             (ENV_DIG_LOCAL_IP, "127.0.0.3"),
             (ENV_DIG_LOCAL_PORT, "8080"),
+            (ENV_SECURE_UPSTREAM, "off"),
         ]))
         .unwrap();
         assert_eq!(c.loopback_ip, Ipv4Addr::new(127, 0, 0, 9));
@@ -287,6 +320,34 @@ mod tests {
         assert_eq!(c.node_url.as_deref(), Some("http://127.0.0.1:9778"));
         assert_eq!(c.dig_local_ip, Ipv4Addr::new(127, 0, 0, 3));
         assert_eq!(c.dig_local_port, 8080);
+        assert!(!c.secure_upstream);
+    }
+
+    #[test]
+    fn secure_upstream_toggle_accepts_on_off_case_insensitively() {
+        assert!(
+            from_env(env_of(&[(ENV_SECURE_UPSTREAM, "ON")]))
+                .unwrap()
+                .secure_upstream
+        );
+        assert!(
+            !from_env(env_of(&[(ENV_SECURE_UPSTREAM, "Off")]))
+                .unwrap()
+                .secure_upstream
+        );
+        assert!(
+            from_env(env_of(&[(ENV_SECURE_UPSTREAM, "  on  ")]))
+                .unwrap()
+                .secure_upstream
+        );
+    }
+
+    #[test]
+    fn secure_upstream_toggle_rejects_garbage() {
+        assert_eq!(
+            from_env(env_of(&[(ENV_SECURE_UPSTREAM, "sometimes")])).unwrap_err(),
+            ConfigError::InvalidToggle("sometimes".to_string())
+        );
     }
 
     #[test]

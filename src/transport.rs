@@ -22,6 +22,7 @@ use crate::node::{
     assemble_windows, build_anchored_root_params, build_content_params, candidate_bases,
     parse_anchored_root, parse_rpc_result, FetchedContent, NodeError,
 };
+use crate::secure_dns::SecureResolver;
 
 /// How long the ladder health-probe waits for a tier to answer before falling through.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -80,7 +81,7 @@ impl ReqwestNodeClient {
     /// earlier tier answered — so this never fails to produce a client.
     pub async fn resolve(config: &Config) -> Result<Self, NodeError> {
         init_crypto();
-        let http = build_http_client()?;
+        let http = build_http_client(config.secure_upstream)?;
         let bases = candidate_bases(config);
         let last = bases.len().saturating_sub(1);
         for (i, base) in bases.iter().enumerate() {
@@ -97,11 +98,13 @@ impl ReqwestNodeClient {
     }
 
     /// Construct a client bound to an explicit base (used by the integration test to point at
-    /// a stub node without ladder probing).
+    /// a stub node without ladder probing). Encrypted upstream resolution stays on (the
+    /// crate-wide default) — harmless here since a stub base is always a loopback IP literal,
+    /// never [`crate::secure_dns::UPSTREAM_HOST`].
     pub fn with_base(base: impl Into<String>) -> Result<Self, NodeError> {
         init_crypto();
         Ok(Self {
-            http: build_http_client()?,
+            http: build_http_client(true)?,
             base: base.into().trim_end_matches('/').to_string(),
         })
     }
@@ -128,13 +131,33 @@ impl ReqwestNodeClient {
     }
 }
 
-/// Build the shared reqwest client (timeouts; rustls already selected at the feature level).
-fn build_http_client() -> Result<reqwest::Client, NodeError> {
-    reqwest::Client::builder()
+/// Build the shared reqwest client (timeouts; rustls already selected at the feature level;
+/// the encrypted-upstream resolver per `secure_upstream`, SPEC §6.4).
+fn build_http_client(secure_upstream: bool) -> Result<reqwest::Client, NodeError> {
+    let builder = reqwest::Client::builder()
         .connect_timeout(PROBE_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT);
+    with_secure_upstream(builder, secure_upstream)?
         .build()
         .map_err(|e| NodeError::Transport(e.to_string()))
+}
+
+/// Attach [`SecureResolver`] to a client builder when `secure_upstream` is enabled; a no-op
+/// otherwise (byte-for-byte prior behavior — the plain hyper-util/OS resolver). Safe to call on
+/// EVERY reqwest client dig-dns builds, not only the one that can reach `rpc.dig.net`: the
+/// resolver only intercepts that one scoped hostname (`crate::secure_dns::is_scoped_host`) —
+/// `dig.local`, `localhost`, and loopback IP literals pass straight through with no added
+/// latency. `pub(crate)` so [`crate::server`]'s `dig.local`-ensure client shares it too.
+pub(crate) fn with_secure_upstream(
+    builder: reqwest::ClientBuilder,
+    secure_upstream: bool,
+) -> Result<reqwest::ClientBuilder, NodeError> {
+    if !secure_upstream {
+        return Ok(builder);
+    }
+    let resolver = SecureResolver::new()
+        .map_err(|e| NodeError::Transport(format!("secure upstream resolver: {e}")))?;
+    Ok(builder.dns_resolver(std::sync::Arc::new(resolver)))
 }
 
 /// Probe `GET <base>/health` with a short timeout — any HTTP response (even non-2xx) counts
@@ -235,6 +258,46 @@ mod tests {
         };
         let c = ReqwestNodeClient::resolve(&cfg).await.unwrap();
         assert_eq!(c.base_url(), "http://127.0.0.1:9");
+    }
+
+    #[tokio::test]
+    async fn resolve_honors_the_secure_upstream_toggle_both_ways() {
+        // Toggle off must build a client exactly as before dig_ecosystem #574 shipped — this is
+        // the "off = prior behavior" contract; toggle on must succeed too (the default).
+        let off = Config {
+            node_url: Some("http://127.0.0.1:9/".to_string()),
+            secure_upstream: false,
+            ..Config::default()
+        };
+        assert!(ReqwestNodeClient::resolve(&off).await.is_ok());
+
+        let on = Config {
+            node_url: Some("http://127.0.0.1:9/".to_string()),
+            secure_upstream: true,
+            ..Config::default()
+        };
+        assert!(ReqwestNodeClient::resolve(&on).await.is_ok());
+    }
+
+    #[test]
+    fn with_secure_upstream_off_is_a_pass_through_builder() {
+        // reqwest is built `rustls-tls-*-no-provider`, so every client construction — even one
+        // that never dials anything — needs the crypto provider installed first (§init_crypto).
+        init_crypto();
+        let builder = reqwest::Client::builder();
+        // Off never touches the resolver — this must succeed with zero network/config access.
+        assert!(with_secure_upstream(builder, false)
+            .unwrap()
+            .build()
+            .is_ok());
+    }
+
+    #[test]
+    fn with_secure_upstream_on_attaches_the_encrypted_resolver() {
+        init_crypto();
+        let builder = reqwest::Client::builder();
+        // On builds SecureResolver (pure config, no I/O) and wires it in — must also succeed.
+        assert!(with_secure_upstream(builder, true).unwrap().build().is_ok());
     }
 
     #[tokio::test]

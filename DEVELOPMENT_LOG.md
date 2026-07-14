@@ -275,3 +275,32 @@ runtime never edits the OS resolver" stays intact; only an explicit elevated sub
   browser under managed policy silently).
 - **DoH caveat:** a Secure-DNS browser bypasses the OS resolver regardless, so it still needs Path B
   (the PAC) or DoH-off — `configure-os` alone cannot fix that.
+
+## Encrypted upstream (`src/secure_dns.rs`): scope by HOSTNAME, not by client (dig_ecosystem #574)
+
+The naive read of the design ("wire the resolver into every `reqwest::Client::builder()` call
+site") is unsafe if taken literally: `ReqwestNodeClient::resolve`'s client dials `dig.local` and
+`localhost` DURING the §5.3 ladder probe BEFORE it might land on `rpc.dig.net`. Wiring an
+always-on encrypted resolver there would route `dig.local`/`localhost` through 3 failing
+DoH/DoT attempts (public resolvers don't special-case these RFC 6761 local names the way an OS
+stub resolver does) before ever falling back — several seconds of added latency on literally
+every `dig-dns` startup, for a name that was never the point.
+
+The fix: `SecureResolver::resolve` checks `is_scoped_host` FIRST and hands anything that isn't
+`rpc.dig.net` straight to the OS resolver with zero chain attempts. This makes it SAFE to wire
+into every client-builder site uniformly (as the design asked) without auditing each one for
+"does this ever see a public hostname" — `dig.local`/`localhost`/a loopback IP literal all take
+the untouched fast path. (Loopback IP LITERALS never even reach a custom resolver at all — confirmed
+in `hyper-util`'s `HttpConnector`, which special-cases a parseable IP and skips DNS resolution
+entirely; that's why `server::probe_gateway_port` and `doctor::build_probe_client`, which only
+ever dial `config.loopback_ip`, are deliberately left un-wired — there is no behavior for the
+resolver to change there.)
+
+`hickory-resolver` 0.26 gotchas: the crate renamed its DoH/DoT Cargo features from the older
+`dns-over-https-rustls`/`dns-over-rustls` to `https-ring`/`tls-ring` (paired with `webpki-roots`
+for the trust store) — `cargo add --dry-run` is the fastest way to discover a renamed feature set
+against whatever version actually resolves. `ResolverOpts` and `NameServerConfig` are
+`#[non_exhaustive]`: build via `Default::default()` then mutate fields (or the crate's own
+`NameServerConfig::https()`/`::tls()` constructors) — a struct-literal is a compile error from
+outside the crate. `ServerOrderingStrategy::UserProvidedOrder` + `num_concurrent_reqs: 1` is what
+makes a tier's two name servers (IPv6 then IPv4) tried strictly in sequence rather than raced.
