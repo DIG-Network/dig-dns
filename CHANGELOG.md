@@ -7,7 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.15.1] - 2026-07-16
 
 ### Bug Fixes
-- **service:** Harden Linux service-binary staging against a symlinked/writable prefix — verify the full `/usr/local/lib` prefix chain (root-owned, non-symlink, non-writable) and create the leaf without following a symlink (#701)
+- **service:** Harden Linux staging against a symlinked/writable prefix (#701) (#24)
 
 ## [0.15.0] - 2026-07-16
 
