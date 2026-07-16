@@ -19,6 +19,7 @@ use serde_json::json;
 
 use crate::config::Config;
 use crate::secure_dns::Tier;
+use crate::system_tool::resolve_system_tool;
 
 /// A single diagnostic check's status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -580,7 +581,7 @@ fn read_browser_doh_policy() -> Vec<String> {
 
 /// `reg query <key> /v <value>` → the value's data, best-effort.
 fn reg_query(key: &str, value: &str) -> Option<String> {
-    let out = std::process::Command::new("reg")
+    let out = std::process::Command::new(resolve_system_tool("reg"))
         .args(["query", key, "/v", value])
         .output()
         .ok()?;
@@ -593,7 +594,7 @@ fn reg_query(key: &str, value: &str) -> Option<String> {
 
 /// `defaults read <domain> <key>` → the value, best-effort.
 fn defaults_read(domain: &str, key: &str) -> Option<String> {
-    let out = std::process::Command::new("defaults")
+    let out = std::process::Command::new(resolve_system_tool("defaults"))
         .args(["read", domain, key])
         .output()
         .ok()?;
@@ -654,7 +655,11 @@ fn port_holder(port: u16) -> Option<String> {
         ),
         _ => ("ss", vec!["-ltnp".into()]),
     };
-    let out = std::process::Command::new(cmd).args(&args).output().ok()?;
+    // Absolute-pathed (#657) so even a diagnostic run cannot be steered to a planted tool.
+    let out = std::process::Command::new(resolve_system_tool(cmd))
+        .args(&args)
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let needle = format!(":{port}");
     // Match `:port` only when NOT followed by another digit, so `:80` does not match `:8000`.

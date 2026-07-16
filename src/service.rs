@@ -6,11 +6,14 @@
 //! the **clean-reinstall** contract:
 //!
 //! * **Service id** — [`SERVICE_LABEL`] `net.dignetwork.dig-dns`, the reverse-DNS name used
-//!   verbatim as the Windows SCM service name (`sc create`/`query`/`start`/`stop`/`delete`) and
-//!   the launchd plist label. On Linux the `service_manager` crate names the systemd unit FILE
-//!   with [`ServiceLabel::to_script_name`] instead (`dignetwork-dig-dns`, dropping the `net`
-//!   qualifier) — see `query_installed`'s doc comment and `SPEC.md` §13.1 for why the probe
-//!   below resolves that form rather than the qualified id.
+//!   verbatim as the Windows SCM service name (`sc create`/`query`/`start`/`stop`/`delete`), the
+//!   launchd plist label, AND — as of dig_ecosystem #523 — the Linux systemd unit file name
+//!   ([`LINUX_UNIT_FILE_NAME`] = `net.dignetwork.dig-dns.service`), identical to the name the
+//!   native `.deb` installs. The CLI Linux path no longer goes through the `service-manager`
+//!   crate (whose `to_script_name` dropped the `net` qualifier to `dignetwork-dig-dns`,
+//!   diverging from the `.deb`); it manages the canonical-named SYSTEM unit directly (running as
+//!   root with a bounded `CAP_NET_BIND_SERVICE`, #528, so it binds `:53`/`:80` and execs the
+//!   binary from any install dir). See `SPEC.md` §13.1.
 //! * **Display name** — [`SERVICE_DISPLAY_NAME`] "DIG NETWORK: DNS", the human-friendly name
 //!   shown in the Windows Services console (set with `sc config … displayname=` after create,
 //!   because `service-manager` 0.7's `sc create` hardcodes the display name to the service id).
@@ -31,16 +34,22 @@
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
+// `FromStr` is only needed to parse the label for the `service-manager`-backed backends (not Linux).
+#[cfg(not(all(unix, not(target_os = "macos"))))]
 use std::str::FromStr;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+// The `service-manager` surface drives the Windows-SCM / macOS-launchd backends; Linux manages its
+// systemd unit directly ([`SystemServiceBackend`] under the linux cfg, #523) and needs none of it.
+#[cfg(not(all(unix, not(target_os = "macos"))))]
 use service_manager::{
     ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager, ServiceStartCtx, ServiceStopCtx,
     ServiceUninstallCtx,
 };
 
 use crate::config::{self, Config};
+use crate::system_tool::resolve_system_tool;
 
 /// The reverse-DNS service id. Used verbatim as the Windows SCM service name, the launchd
 /// plist label, and the systemd unit name. `ServiceLabel::to_qualified_name` rejoins its 3
@@ -60,11 +69,14 @@ const REMOVAL_POLL_ATTEMPTS: u32 = 40;
 const REMOVAL_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Whether user-level (no-elevation) install is supported on this OS. Windows SCM is
-/// system-only; systemd/launchd support a user domain.
-#[cfg(windows)]
-const PREFERS_USER_LEVEL: bool = false;
-#[cfg(not(windows))]
+/// system-only. Linux is system-level too (dig_ecosystem #523/#528): dig-dns binds the privileged
+/// loopback ports `:53`/`:80`, which a user-domain systemd unit cannot, so the CLI registers a
+/// SYSTEM unit under the canonical `net.dignetwork.dig-dns` name — identical to the native `.deb`.
+/// Only macOS keeps a user-domain launchd agent.
+#[cfg(target_os = "macos")]
 const PREFERS_USER_LEVEL: bool = true;
+#[cfg(not(target_os = "macos"))]
+const PREFERS_USER_LEVEL: bool = false;
 
 /// What to register: the service identity + the program the SCM/launchd/systemd runs, plus the
 /// environment that reproduces the resolved [`Config`] so the installed service serves
@@ -255,18 +267,27 @@ pub struct ServiceOutcome {
 }
 
 /// Build the parsed service label (infallible for our constant, but the crate returns a
-/// Result, so surface a clear error if the constant is ever mis-edited).
+/// Result, so surface a clear error if the constant is ever mis-edited). Used by the
+/// `service-manager`-backed Windows/macOS backends; Linux registers the raw canonical name (#523).
+#[cfg(not(all(unix, not(target_os = "macos"))))]
 fn label() -> io::Result<ServiceLabel> {
     ServiceLabel::from_str(SERVICE_LABEL)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
 }
 
-/// On Windows, is this process elevated (Administrator)? Used to fail `install`/`uninstall`
-/// early with a helpful message instead of a cryptic SCM access-denied. Always `true` off
-/// Windows (those paths are user-level).
+/// Does this platform require elevation to (un)install the service, and if so, do we HAVE it?
+/// `install`/`uninstall` call this to fail early with a helpful message instead of a cryptic
+/// deep-in-the-OS access-denied.
+///
+/// - **Windows** — needs an elevated (Administrator) token (SCM is system-scope).
+/// - **Linux** — needs root (dig_ecosystem #523/#528): the unit is written to `/etc/systemd/system`
+///   and runs at systemd system scope binding the privileged `:53`/`:80` ports.
+/// - **macOS** — the launchd install is a user-domain agent, so no elevation is required.
 #[cfg(windows)]
-fn is_elevated() -> bool {
-    std::process::Command::new("net")
+fn has_required_elevation() -> bool {
+    // Absolute-pathed (#657): this runs under elevation, so a bare `net` could be hijacked by a
+    // search-order-planted binary in an attacker-controlled working directory.
+    std::process::Command::new(resolve_system_tool("net"))
         .arg("session")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -274,20 +295,55 @@ fn is_elevated() -> bool {
         .map(|s| s.success())
         .unwrap_or(false)
 }
-#[cfg(not(windows))]
-fn is_elevated() -> bool {
+#[cfg(all(unix, not(target_os = "macos")))]
+fn has_required_elevation() -> bool {
+    // Root check via `id -u` (absolute-pathed, #657); root's effective uid is 0.
+    std::process::Command::new(resolve_system_tool("id"))
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false)
+}
+#[cfg(target_os = "macos")]
+fn has_required_elevation() -> bool {
     true
 }
 
-/// The real [`ServiceBackend`]: the native OS service manager (user-level on Linux/macOS,
-/// system-level on Windows) plus the OS existence probe and the Windows display-name override.
+/// Whether this platform's install requires elevation at all (so the caller can tailor the
+/// refusal message). Only macOS's user-domain launchd agent does not.
+#[cfg(not(target_os = "macos"))]
+const INSTALL_REQUIRES_ELEVATION: bool = true;
+#[cfg(target_os = "macos")]
+const INSTALL_REQUIRES_ELEVATION: bool = false;
+
+/// The platform-specific elevation-refusal message for `install`/`uninstall`.
+fn elevation_refusal(action: &str) -> io::Error {
+    let how = if cfg!(windows) {
+        "an elevated (Administrator) console. Re-run this in a terminal opened with \
+         \"Run as administrator\"."
+    } else {
+        "root. Re-run with sudo."
+    };
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("dig-dns: {action} the service requires {how}"),
+    )
+}
+
+/// The real [`ServiceBackend`] on Windows (SCM) and macOS (launchd): the native `service-manager`
+/// crate, system-level on Windows, user-domain on macOS. Linux does NOT use this — see
+/// [`LinuxSystemdBackend`], which manages the canonical-named system unit directly (#523).
+#[cfg(not(all(unix, not(target_os = "macos"))))]
 pub struct SystemServiceBackend {
     label: ServiceLabel,
     manager: Box<dyn ServiceManager>,
-    /// Whether the manager is operating at user level (Linux/macOS) — surfaced for messaging.
+    /// Whether the manager is operating at user level (macOS) — surfaced for messaging.
     user_level: bool,
 }
 
+#[cfg(not(all(unix, not(target_os = "macos"))))]
 impl SystemServiceBackend {
     /// Acquire the native service manager, set to user-level where the platform supports it.
     pub fn new() -> io::Result<Self> {
@@ -309,6 +365,7 @@ impl SystemServiceBackend {
     }
 }
 
+#[cfg(not(all(unix, not(target_os = "macos"))))]
 impl ServiceBackend for SystemServiceBackend {
     fn is_installed(&self) -> io::Result<bool> {
         Ok(query_installed(&self.label))
@@ -362,7 +419,7 @@ fn query_installed(label: &ServiceLabel) -> bool {
     // id verbatim (`ctx.label.to_qualified_name()`), matching SERVICE_LABEL. `sc query <name>`
     // exits 0 when it exists, 1060 (does-not-exist) otherwise.
     let service_name = label.to_qualified_name();
-    std::process::Command::new("sc.exe")
+    std::process::Command::new(resolve_system_tool("sc.exe"))
         .args(["query", &service_name])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -379,7 +436,7 @@ fn query_installed(label: &ServiceLabel) -> bool {
     // verbatim (`ctx.label.to_qualified_name()`), matching SERVICE_LABEL.
     let service_name = label.to_qualified_name();
     let domain = launchd_domain_target(&service_name);
-    std::process::Command::new("launchctl")
+    std::process::Command::new(resolve_system_tool("launchctl"))
         .args(["print", &domain])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -388,48 +445,271 @@ fn query_installed(label: &ServiceLabel) -> bool {
         .unwrap_or(false)
 }
 
-/// Linux systemd existence probe: is the unit FILE present at the path `service-manager`'s
-/// `SystemdServiceManager` writes it to (the user unit dir for our user-level install; see
-/// [`PREFERS_USER_LEVEL`])?
+// ---------------------------------------------------------------------------------------------
+// Linux systemd backend (#523) — the canonical-named system unit, managed directly.
+// ---------------------------------------------------------------------------------------------
+
+/// The canonical systemd unit FILE name on Linux: `net.dignetwork.dig-dns.service` — the
+/// [`SERVICE_LABEL`] id plus `.service`, IDENTICAL to the name the native `.deb` installs
+/// ([`crate::packaging::SYSTEMD_UNIT_PATH`]) and to the launchd/Windows id. This is the
+/// dig_ecosystem #523 unification: the CLI install path and the `.deb` register the SAME unit
+/// name, so `systemctl … net.dignetwork.dig-dns` addresses one service however it was installed.
 ///
-/// **Naming (the dig_ecosystem #502 bug):** unlike the Windows/macOS backends above,
-/// `SystemdServiceManager` does NOT name the unit file with the fully-qualified id
-/// (`to_qualified_name`, `"net.dignetwork.dig-dns"`) — it names it with `to_script_name()`
-/// (`"{organization}-{application}"`, i.e. `"dignetwork-dig-dns"`, DROPPING the `net` qualifier
-/// entirely). Probing for the qualified-name file (the original implementation, mirroring
-/// Windows/macOS) therefore checked a path that never existed, so `is_installed` silently always
-/// reported `false` even immediately after a real, confirmed-RUNNING install — defeating
-/// [`reinstall`]'s existed-detection (`report.existed`/`reinstalled` wrongly `false`) and
-/// `status`'s `registered` field. Only real-OS testing surfaces this (dig_ecosystem #502's
-/// service-smoke CI caught it; the mock-backed unit tests below can't, since the mock never
-/// shells out or touches a real path). Checking the file the manager ACTUALLY writes is also
-/// immune to any systemd-manager load/cache timing a `systemctl cat` round-trip could have.
-///
-/// This is a probe-naming fix only — it does not change what `create`/`delete` register the
-/// service AS (still the [`SERVICE_LABEL`] identity via the `service_manager` crate); see
-/// `SPEC.md` §13.1 for the resulting on-disk unit filename this implies.
+/// The prior CLI path went through the `service-manager` crate, whose `SystemdServiceManager`
+/// derives the file name from `ServiceLabel::to_script_name()` — `dignetwork-dig-dns`, DROPPING
+/// the `net` qualifier — diverging from the `.deb`. The Linux backend below bypasses that crate
+/// and writes the canonical name directly. See `SPEC.md` §13.1.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn query_installed(label: &ServiceLabel) -> bool {
-    systemd_unit_file_path(&label.to_script_name())
-        .map(|p| p.is_file())
-        .unwrap_or(false)
+pub const LINUX_UNIT_FILE_NAME: &str = "net.dignetwork.dig-dns.service";
+
+/// The admin unit directory the CLI writes the unit to. `/etc/systemd/system` (the machine
+/// administrator's unit dir) rather than the `.deb`'s `/lib/systemd/system` (the package-vendor
+/// dir) — the correct home for a manually-run `dig-dns install`, and one that takes precedence if
+/// both ever coexist. Same NAME as the `.deb` regardless (#523).
+#[cfg(all(unix, not(target_os = "macos")))]
+const LINUX_UNIT_DIR: &str = "/etc/systemd/system";
+
+/// The absolute path of the canonical Linux unit file. PURE.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_unit_file_path() -> PathBuf {
+    PathBuf::from(LINUX_UNIT_DIR).join(LINUX_UNIT_FILE_NAME)
 }
 
-/// Where `service-manager`'s systemd backend places the unit file for our install level (see
-/// [`PREFERS_USER_LEVEL`]): the user unit dir (`$XDG_CONFIG_HOME/systemd/user`, `None` only if
-/// the home directory cannot be resolved) or the global `/etc/systemd/system`. `unit_stem` MUST
-/// be a [`ServiceLabel::to_script_name`] result, not [`ServiceLabel::to_qualified_name`] (see
-/// [`query_installed`] above). PURE path arithmetic reusing the SAME helpers
-/// `service_manager::SystemdServiceManager` itself calls, so this can never drift from where
-/// `create`/`delete` actually write.
+/// The ROOT-OWNED directory the CLI install COPIES the `dig-dns` binary into before pointing the
+/// root systemd unit's `ExecStart` at it (dig_ecosystem #565). `/usr/local/lib` is the standard
+/// root-owned prefix for machine-local software; a non-root user cannot write there.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn systemd_unit_file_path(unit_stem: &str) -> Option<PathBuf> {
-    let dir = if PREFERS_USER_LEVEL {
-        service_manager::systemd_user_dir_path().ok()?
+const LINUX_PROGRAM_DIR: &str = "/usr/local/lib/dig-dns";
+
+/// The file name of the copied binary inside [`LINUX_PROGRAM_DIR`].
+#[cfg(all(unix, not(target_os = "macos")))]
+const LINUX_PROGRAM_NAME: &str = "dig-dns";
+
+/// The absolute path of the root-owned binary copy the Linux unit's `ExecStart` targets. PURE —
+/// a FIXED root-owned location, deliberately INDEPENDENT of `current_exe()` so the unit can never
+/// exec a user-writable path. This is the #565 LPE fix: the prior design baked `current_exe()`
+/// (which #528 pointed at a user-writable `~/.dig/bin/dig-dns`) verbatim into a root unit, so any
+/// later write to that home path by the unprivileged user became persistent root RCE at the next
+/// service restart. Copying into a root-owned dir + verifying ownership closes that door.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_program_dest() -> PathBuf {
+    PathBuf::from(LINUX_PROGRAM_DIR).join(LINUX_PROGRAM_NAME)
+}
+
+/// Is a filesystem entry with owner `uid` and permission `mode` safe to exec as root — i.e.
+/// root-owned AND not group/world-writable? PURE (takes the stat fields), so both the accept and
+/// reject arms are unit-tested without needing a real root-owned file. `mode & 0o022` is the
+/// group-write (`0o020`) + other-write (`0o002`) bits; either being set means a non-owner could
+/// replace/modify the target, so a root unit must refuse it (dig_ecosystem #565).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn root_owned_not_writable(uid: u32, mode: u32) -> bool {
+    uid == 0 && (mode & 0o022) == 0
+}
+
+/// Fail-closed guard: error unless `path` (via `symlink_metadata`, so a symlink is judged on its
+/// OWN ownership, never its target) is root-owned and not group/world-writable. Used to VERIFY the
+/// staged binary + its directory before a root unit is allowed to exec them (#565). Mirrors the
+/// sibling ownership guards in dig-node (`resolve_privileged_sibling`) and dig-installer
+/// (`protected_bin_dir`).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn ensure_root_owned_not_writable(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::symlink_metadata(path)?;
+    if !root_owned_not_writable(meta.uid(), meta.mode()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "dig-dns: refusing to install a root service that execs {} — it must be owned by \
+                 root (uid 0) and not group/world-writable, but it is owned by uid {} with mode \
+                 {:o}. Install dig-dns to a root-owned prefix and retry.",
+                path.display(),
+                meta.uid(),
+                meta.mode() & 0o7777,
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Stage the running binary into the ROOT-OWNED [`LINUX_PROGRAM_DIR`] and return the destination
+/// path the root systemd unit's `ExecStart` will target (dig_ecosystem #565). Runs as root (the
+/// install entrypoint has already verified elevation). The copy — rather than baking
+/// `current_exe()` — is what guarantees the unit never execs a user-writable binary as root:
+///
+/// 1. create [`LINUX_PROGRAM_DIR`], `chown root:root`, `0755`;
+/// 2. remove any pre-existing destination (via `remove_file`, which unlinks a planted symlink
+///    instead of following it) and copy the current binary in;
+/// 3. `chown root:root` + `0755` the copy;
+/// 4. VERIFY (fail-closed) both the directory and the copied file are root-owned + not
+///    group/world-writable before returning — so a hostile pre-seeded dir/symlink is caught.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn stage_service_program() -> io::Result<PathBuf> {
+    use std::fs::Permissions;
+    use std::os::unix::fs::{chown, PermissionsExt};
+
+    let source = std::env::current_exe()?;
+    let dir = PathBuf::from(LINUX_PROGRAM_DIR);
+    std::fs::create_dir_all(&dir)?;
+    chown(&dir, Some(0), Some(0))?;
+    std::fs::set_permissions(&dir, Permissions::from_mode(0o755))?;
+
+    let dest = linux_program_dest();
+    // Unlink any existing entry first: remove_file removes a symlink itself (never its target), so
+    // a pre-seeded symlink at `dest` cannot redirect the copy into an attacker-controlled path.
+    let _ = std::fs::remove_file(&dest);
+    std::fs::copy(&source, &dest)?;
+    chown(&dest, Some(0), Some(0))?;
+    std::fs::set_permissions(&dest, Permissions::from_mode(0o755))?;
+
+    // Fail closed: NEVER hand a non-root-owned or writable path to a root unit's ExecStart.
+    ensure_root_owned_not_writable(&dir)?;
+    ensure_root_owned_not_writable(&dest)?;
+    Ok(dest)
+}
+
+/// Build the systemd unit contents for a CLI install from the resolved [`InstallPlan`]. PURE (no
+/// I/O), so the exact unit body is unit-tested.
+///
+/// **Runs as root, execing a ROOT-OWNED binary copy.** The service runs as root (no
+/// `User=`/`DynamicUser=`), exactly like the `.deb` unit ([`crate::packaging::systemd_unit`]): a
+/// dedicated unprivileged account cannot traverse into a user's `0750` home to `execve` a binary
+/// (systemd `203/EXEC`), whereas root can exec from a system install location. To avoid the #565
+/// local-privilege-escalation (a root unit must NEVER exec a user-writable path), the install
+/// COPIES the binary into the root-owned [`LINUX_PROGRAM_DIR`] and points `ExecStart` there — so
+/// `plan.program` is always a root-owned path, never `current_exe()`. The privilege is then
+/// narrowed to exactly what binding `:53`/`:80` needs — `AmbientCapabilities`/
+/// `CapabilityBoundingSet=CAP_NET_BIND_SERVICE`, `NoNewPrivileges`, `ProtectSystem`/`ProtectHome`/
+/// `PrivateTmp` — a loopback-only service holding no secret material. The resolved config is baked
+/// in as `Environment=` lines so the unit serves identically to the invoking `dig-dns serve`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_unit_contents(plan: &InstallPlan) -> String {
+    use crate::packaging::NET_BIND_CAPABILITY;
+
+    let program = plan.program.display();
+    let args: Vec<String> = plan
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let exec_args = args.join(" ");
+    let env_lines: String = plan
+        .environment
+        .iter()
+        .map(|(k, v)| format!("Environment={k}={v}\n"))
+        .collect();
+    let wanted_by = if plan.autostart {
+        "\n[Install]\nWantedBy=multi-user.target\n"
     } else {
-        service_manager::systemd_global_dir_path()
+        ""
     };
-    Some(dir.join(format!("{unit_stem}.service")))
+
+    format!(
+        "[Unit]\n\
+         Description={SERVICE_DISPLAY_NAME} — local *.dig resolver (DNS responder + HTTP gateway)\n\
+         Documentation=https://docs.dig.net\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={program} {exec_args}\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         # Runs as root so ExecStart can reach the root-owned binary copy (#565); privilege is\n\
+         # then bounded to exactly the loopback :53/:80 bind (#177).\n\
+         AmbientCapabilities={NET_BIND_CAPABILITY}\n\
+         CapabilityBoundingSet={NET_BIND_CAPABILITY}\n\
+         StateDirectory=dig-dns\n\
+         NoNewPrivileges=true\n\
+         ProtectSystem=full\n\
+         # read-only: the service holds no secret material and never needs to write a home dir;\n\
+         # read-only blocks writes while still allowing reads, a harmless defensive default (#528).\n\
+         ProtectHome=read-only\n\
+         PrivateTmp=true\n\
+         {env_lines}\
+         {wanted_by}"
+    )
+}
+
+/// The real Linux [`ServiceBackend`]: manages the canonical-named system unit directly via a unit
+/// file in [`LINUX_UNIT_DIR`] + `systemctl` (#523). Requires root (systemd system scope + the
+/// privileged loopback ports); the `install`/`uninstall` entrypoints check elevation up front.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub struct SystemServiceBackend {
+    unit_path: PathBuf,
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl SystemServiceBackend {
+    /// Construct the Linux systemd backend (infallible — no manager handle to acquire).
+    pub fn new() -> io::Result<Self> {
+        Ok(Self {
+            unit_path: linux_unit_file_path(),
+        })
+    }
+
+    /// Linux always installs at SYSTEM level ([`PREFERS_USER_LEVEL`] is `false`); never user level.
+    pub fn user_level(&self) -> bool {
+        PREFERS_USER_LEVEL
+    }
+
+    /// Run `systemctl <args…>`, mapping a non-zero exit to an `io::Error`. `systemctl` is resolved
+    /// to its trusted absolute path (#657) since this runs as root.
+    fn systemctl(args: &[&str]) -> io::Result<()> {
+        let status = std::process::Command::new(resolve_system_tool("systemctl"))
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "systemctl {} exited non-zero",
+                args.join(" ")
+            )))
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl ServiceBackend for SystemServiceBackend {
+    fn is_installed(&self) -> io::Result<bool> {
+        Ok(self.unit_path.is_file())
+    }
+
+    fn stop(&self) -> io::Result<()> {
+        Self::systemctl(&["stop", LINUX_UNIT_FILE_NAME])
+    }
+
+    fn delete(&self) -> io::Result<()> {
+        // Disable (drops the [Install] symlinks) best-effort, then remove the unit file and
+        // reload so systemd forgets it — the mirror of `create`.
+        let _ = Self::systemctl(&["disable", LINUX_UNIT_FILE_NAME]);
+        if self.unit_path.exists() {
+            std::fs::remove_file(&self.unit_path)?;
+        }
+        let _ = Self::systemctl(&["daemon-reload"]);
+        Ok(())
+    }
+
+    fn create(&self, plan: &InstallPlan) -> io::Result<()> {
+        // Write the unit via the symlink-safe atomic writer (#650): O_NOFOLLOW temp create +
+        // rename-over, so a pre-seeded symlink at the unit path can never redirect this root write
+        // (consistent with the resolver-file writer in `os_config`).
+        crate::os_config::atomic_write(&self.unit_path, &linux_unit_contents(plan))
+            .map_err(io::Error::other)?;
+        Self::systemctl(&["daemon-reload"])?;
+        if plan.autostart {
+            Self::systemctl(&["enable", LINUX_UNIT_FILE_NAME])?;
+        }
+        Ok(())
+    }
+
+    fn start(&self) -> io::Result<()> {
+        Self::systemctl(&["start", LINUX_UNIT_FILE_NAME])
+    }
 }
 
 /// The launchd domain target (`gui/<uid>/<label>` for a user agent, `system/<label>` for a
@@ -445,8 +725,9 @@ fn launchd_domain_target(service_name: &str) -> String {
 
 #[cfg(target_os = "macos")]
 fn libc_getuid() -> u32 {
-    // Avoid a `libc` dependency for one call: read the effective uid via `id -u`.
-    std::process::Command::new("id")
+    // Avoid a `libc` dependency for one call: read the effective uid via `id -u` (absolute-pathed
+    // for the same anti-hijack reason as the elevated spawns, #657).
+    std::process::Command::new(resolve_system_tool("id"))
         .arg("-u")
         .output()
         .ok()
@@ -460,7 +741,7 @@ fn libc_getuid() -> u32 {
 #[cfg(windows)]
 fn set_windows_display_name(service_name: &str, display_name: &str) {
     let args = display_name_config_args(service_name, display_name);
-    let _ = std::process::Command::new("sc.exe")
+    let _ = std::process::Command::new(resolve_system_tool("sc.exe"))
         .args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -470,17 +751,26 @@ fn set_windows_display_name(service_name: &str, display_name: &str) {
 /// Install `dig-dns` as an auto-starting OS service via the clean-reinstall contract (stop →
 /// delete → recreate on an existing service; create otherwise). The service runs `dig-dns
 /// serve` (or `run-service` on Windows) with the resolved `config` baked into its environment.
+/// Resolve the program path the installed service will exec. On Linux the binary is COPIED into a
+/// root-owned dir first and THAT path is used (dig_ecosystem #565 — never exec a user-writable
+/// binary as root); every other platform runs `current_exe()` directly (Windows SCM installs from
+/// a root-owned Program Files path; macOS installs a user-domain agent, no root exec).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn resolve_install_program() -> io::Result<PathBuf> {
+    stage_service_program()
+}
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn resolve_install_program() -> io::Result<PathBuf> {
+    std::env::current_exe()
+}
+
 pub fn install(config: &Config) -> io::Result<ServiceOutcome> {
-    if cfg!(windows) && !is_elevated() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "dig-dns: installing a Windows service requires an elevated (Administrator) \
-             console. Re-run this in a terminal opened with \"Run as administrator\".",
-        ));
+    if INSTALL_REQUIRES_ELEVATION && !has_required_elevation() {
+        return Err(elevation_refusal("installing"));
     }
 
     let backend = SystemServiceBackend::new()?;
-    let program = std::env::current_exe()?;
+    let program = resolve_install_program()?;
     let plan = build_plan(config, program.clone());
     let report = reinstall(&backend, &plan)?;
 
@@ -522,12 +812,8 @@ pub fn install(config: &Config) -> io::Result<ServiceOutcome> {
 
 /// Uninstall the `dig-dns` service. Stops it first (best-effort) so the removal is clean.
 pub fn uninstall() -> io::Result<ServiceOutcome> {
-    if cfg!(windows) && !is_elevated() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "dig-dns: uninstalling a Windows service requires an elevated (Administrator) \
-             console.",
-        ));
+    if INSTALL_REQUIRES_ELEVATION && !has_required_elevation() {
+        return Err(elevation_refusal("uninstalling"));
     }
     let backend = SystemServiceBackend::new()?;
     let _ = backend.stop();
@@ -613,12 +899,91 @@ pub fn status(config: &Config) -> io::Result<ServiceOutcome> {
     Ok(ServiceOutcome { summary, json: obj })
 }
 
+/// Query the running service's machine-readable health (`GET /.dig/health`) over loopback and
+/// print it — the CLI verb that mirrors the gateway's `/.dig/health` control endpoint, so the same
+/// service state is obtainable from the command line, not only over HTTP (CLAUDE.md §6.2 machine-
+/// consumable parity; dig_ecosystem #569). Tries the primary HTTP port then the `:8053` fallback.
+///
+/// When the service is reachable the endpoint's JSON body is surfaced verbatim as the `--json`
+/// object (and summarised for humans). When nothing answers, `serving` is `false` and the caller
+/// maps that to a non-zero exit — the same contract as `status`.
+pub fn health(config: &Config) -> io::Result<ServiceOutcome> {
+    let ip = config.loopback_ip.to_string();
+    let fetched = fetch_control_body(&ip, config.http_port, "/.dig/health")
+        .or_else(|| fetch_control_body(&ip, config.http_fallback_port, "/.dig/health"));
+
+    match fetched.and_then(|body| serde_json::from_str::<Value>(&body).ok()) {
+        Some(health) => {
+            let bound = health
+                .get("bound_port")
+                .and_then(Value::as_u64)
+                .map(|p| format!("{ip}:{p}"))
+                .unwrap_or_else(|| format!("{ip}:{}", config.http_port));
+            let node_reachable = health
+                .get("node")
+                .and_then(|n| n.get("reachable"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let summary =
+                format!("dig-dns: SERVING on http://{bound} (node reachable: {node_reachable})");
+            Ok(ServiceOutcome {
+                summary,
+                json: json!({ "serving": true, "health": health }),
+            })
+        }
+        None => Ok(ServiceOutcome {
+            summary: format!(
+                "dig-dns: NOT responding on http://{ip}:{} — the service may be stopped or not \
+                 installed (see: dig-dns status)",
+                config.http_port
+            ),
+            json: json!({ "serving": false, "label": SERVICE_LABEL }),
+        }),
+    }
+}
+
 /// Blocking gateway probe over loopback: try the primary HTTP port then the `:8053` fallback,
 /// GET the `/.dig/resolve-probe` liveness endpoint, and report whether either answers 2xx.
 /// Kept blocking (no async runtime) so `status` stays a lightweight one-shot.
 fn probe_serving(config: &Config) -> bool {
     let ip = config.loopback_ip.to_string();
     probe_resolve(&ip, config.http_port) || probe_resolve(&ip, config.http_fallback_port)
+}
+
+/// Blocking HTTP/1.0 `GET <path>` over loopback returning the response BODY when the status is 2xx,
+/// else `None`. Shares the [`PROBE_TIMEOUT`] connect/read bounds with [`probe_resolve`] so a CLI
+/// verb built on it (e.g. [`health`]) can never hang on an unrouted loopback IP (dig_ecosystem
+/// #502). Reads the whole response then splits off the body at the header terminator.
+fn fetch_control_body(ip: &str, port: u16, path: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let addr = format!("{ip}:{port}");
+    let socket_addr = addr.parse().ok()?;
+    let mut stream = TcpStream::connect_timeout(&socket_addr, PROBE_TIMEOUT).ok()?;
+    let _ = stream.set_read_timeout(Some(PROBE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(PROBE_TIMEOUT));
+    let req = format!("GET {path} HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).ok()?;
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).ok()?;
+    let text = String::from_utf8_lossy(&raw);
+    let (head, body) = split_http_message(&text)?;
+    is_2xx_status_line(head).then(|| body.to_string())
+}
+
+/// Split a raw HTTP response into its (status line + headers) head and its body, at the first
+/// blank line (`\r\n\r\n`, tolerating a bare `\n\n`). Returns `None` when no terminator is present.
+/// PURE — the parsing is unit-tested without a socket.
+fn split_http_message(response: &str) -> Option<(&str, &str)> {
+    if let Some(idx) = response.find("\r\n\r\n") {
+        Some((&response[..idx], &response[idx + 4..]))
+    } else {
+        response
+            .find("\n\n")
+            .map(|idx| (&response[..idx], &response[idx + 2..]))
+    }
 }
 
 /// How long [`probe_resolve`] waits on EACH phase (connect, then read) before giving up. Applied
@@ -691,43 +1056,118 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
     fn service_label_parses_as_three_reverse_dns_segments() {
         let l = label().expect("constant label must parse");
-        // `to_qualified_name` must reproduce the literal id we register/query under.
+        // `to_qualified_name` must reproduce the literal id we register/query under (the
+        // Windows-SCM / macOS-launchd identity; Linux registers the raw canonical name, #523).
         assert_eq!(l.to_qualified_name(), SERVICE_LABEL);
     }
 
     #[test]
     #[cfg(all(unix, not(target_os = "macos")))]
-    fn systemd_unit_file_path_lands_under_the_expected_dir_with_the_service_suffix() {
-        // Regression for dig_ecosystem #502: `query_installed` must resolve the SAME path
-        // `service-manager`'s SystemdServiceManager writes to (whichever level PREFERS_USER_LEVEL
-        // selects), never a path a real reinstall wouldn't actually touch.
-        let path = systemd_unit_file_path("dignetwork-dig-dns").expect("home dir resolvable");
+    fn linux_unit_file_uses_the_canonical_dotted_name_matching_the_deb() {
+        // dig_ecosystem #523: the CLI Linux install path MUST register the unit under the SAME
+        // canonical name the native .deb installs — `net.dignetwork.dig-dns.service`, the
+        // SERVICE_LABEL id + `.service` — NOT the `service-manager` crate's `dignetwork-dig-dns`
+        // (to_script_name, which drops the `net` qualifier). One name however it was installed.
+        assert_eq!(LINUX_UNIT_FILE_NAME, "net.dignetwork.dig-dns.service");
+        assert_eq!(LINUX_UNIT_FILE_NAME, format!("{SERVICE_LABEL}.service"));
+        // The .deb's unit file name (its own path constant) agrees, byte-for-byte.
+        assert!(crate::packaging::SYSTEMD_UNIT_PATH.ends_with(LINUX_UNIT_FILE_NAME));
+        // Written to the admin unit dir under the canonical name.
         assert_eq!(
-            path.file_name().and_then(|n| n.to_str()),
-            Some("dignetwork-dig-dns.service")
+            linux_unit_file_path(),
+            PathBuf::from("/etc/systemd/system/net.dignetwork.dig-dns.service")
         );
-        if PREFERS_USER_LEVEL {
-            assert!(path.ends_with("systemd/user/dignetwork-dig-dns.service"));
-        } else {
-            assert_eq!(
-                path,
-                PathBuf::from("/etc/systemd/system/dignetwork-dig-dns.service")
-            );
-        }
     }
 
     #[test]
     #[cfg(all(unix, not(target_os = "macos")))]
-    fn service_label_script_name_drops_the_qualifier_unlike_qualified_name() {
-        // Pins the exact naming mismatch dig_ecosystem #502 uncovered: `to_script_name()` (what
-        // `SystemdServiceManager` actually files the unit under) is NOT `to_qualified_name()`
-        // (what SERVICE_LABEL/Windows/macOS use) -- it drops the `net` qualifier and joins with
-        // `-` instead of `.`. `query_installed`'s Linux branch MUST use `to_script_name()`.
-        let l = label().expect("constant label must parse");
-        assert_eq!(l.to_qualified_name(), "net.dignetwork.dig-dns");
-        assert_eq!(l.to_script_name(), "dignetwork-dig-dns");
+    fn linux_unit_contents_run_as_root_with_bounded_capability_and_baked_env() {
+        // The unit runs as root (no User=/DynamicUser=, so ExecStart can reach the system binary),
+        // bounded to CAP_NET_BIND_SERVICE, with the resolved config baked as Environment= lines and
+        // ExecStart pointing at the root-owned staged binary (#565), never at current_exe().
+        let config = Config {
+            http_port: 8080,
+            tld: "dig".to_string(),
+            ..Config::default()
+        };
+        let plan = build_plan(&config, linux_program_dest());
+        let unit = linux_unit_contents(&plan);
+
+        assert!(unit.contains("ExecStart=/usr/local/lib/dig-dns/dig-dns serve"));
+        assert!(unit.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE"));
+        assert!(unit.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE"));
+        assert!(unit.contains("NoNewPrivileges=true"));
+        // ProtectHome stays read-only: a harmless defensive default for a service that holds no
+        // secret material and never writes a home dir (#528).
+        assert!(unit.contains("ProtectHome=read-only"));
+        assert!(!unit.contains("ProtectHome=true"));
+        // Runs as root: it must NOT drop to a dedicated account (the .deb runs as root too).
+        assert!(!unit.contains("User="));
+        assert!(!unit.contains("DynamicUser="));
+        // Baked config + autostart install section.
+        assert!(unit.contains(&format!("Environment={}=8080", config::ENV_HTTP_PORT)));
+        assert!(unit.contains("Environment=DIG_DNS_TLD=dig"));
+        assert!(unit.contains("[Install]\nWantedBy=multi-user.target"));
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn linux_program_dest_is_a_fixed_root_owned_path_not_a_home_dir() {
+        // #565: the ExecStart target is a FIXED root-owned location, deliberately independent of
+        // current_exe() — so a root unit can never end up execing a user-writable ~/.dig/bin path.
+        let dest = linux_program_dest();
+        assert_eq!(dest, PathBuf::from("/usr/local/lib/dig-dns/dig-dns"));
+        assert!(dest.is_absolute());
+        let s = dest.to_string_lossy();
+        assert!(
+            s.starts_with("/usr/local/lib/"),
+            "must be under a root-owned prefix"
+        );
+        assert!(!s.contains("/home/"), "must never be a user home path");
+        assert!(
+            !s.contains(".dig/bin"),
+            "must never be the user-writable ~/.dig/bin path"
+        );
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn root_owned_not_writable_accepts_only_root_owned_unwritable_entries() {
+        // ACCEPT: root-owned (uid 0), no group/other write bits.
+        assert!(root_owned_not_writable(0, 0o755));
+        assert!(root_owned_not_writable(0, 0o644));
+        assert!(root_owned_not_writable(0, 0o700));
+        // REJECT: not root-owned — the LPE vector (a user-writable binary exec'd as root).
+        assert!(!root_owned_not_writable(1000, 0o755));
+        // REJECT: root-owned but group- or world-writable (a non-owner could replace it).
+        assert!(!root_owned_not_writable(0, 0o775)); // group-writable
+        assert!(!root_owned_not_writable(0, 0o757)); // world-writable
+        assert!(!root_owned_not_writable(0, 0o777));
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn ensure_root_owned_not_writable_rejects_a_user_owned_binary() {
+        // A file this (non-root) test process creates is owned by the test user, NOT root — the
+        // exact LPE condition #565 must refuse. Fails closed with PermissionDenied.
+        let dir = std::env::temp_dir().join(format!("dig-dns-own-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("dig-dns");
+        std::fs::write(&f, b"#!/bin/true\n").unwrap();
+
+        // Only meaningful when the test runs unprivileged (the common `cargo test` case): a root
+        // test runner would legitimately own the file. Assert the fail-closed reject otherwise.
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::metadata(&f).unwrap().uid() != 0 {
+            let err = ensure_root_owned_not_writable(&f)
+                .expect_err("a user-owned binary must be refused for a root unit");
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -833,6 +1273,52 @@ mod tests {
             let _installed = backend.is_installed().expect("probe never hard-errors");
             let _user_level = backend.user_level();
         }
+    }
+
+    #[test]
+    fn split_http_message_separates_head_from_body_crlf_and_bare_lf() {
+        let (head, body) = split_http_message(
+            "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"a\":1}",
+        )
+        .expect("has a header terminator");
+        assert!(head.starts_with("HTTP/1.0 200 OK"));
+        assert_eq!(body, "{\"a\":1}");
+
+        let (head2, body2) =
+            split_http_message("HTTP/1.0 204 No Content\n\nbody").expect("bare LF terminator");
+        assert!(head2.contains("204"));
+        assert_eq!(body2, "body");
+
+        assert!(split_http_message("no terminator here").is_none());
+    }
+
+    #[test]
+    fn health_reports_not_serving_when_the_gateway_is_absent() {
+        // dig_ecosystem #569: the `health` CLI verb mirrors `/.dig/health`. With nothing bound on
+        // these high loopback ports it must report a clean not-serving result (never hang, never
+        // hard-error) and mark serving=false so the CLI exits non-zero.
+        let cfg = Config {
+            http_port: 59_133,
+            http_fallback_port: 59_134,
+            ..Config::default()
+        };
+        let outcome = health(&cfg).expect("health never hard-errors");
+        assert_eq!(outcome.json["serving"], json!(false));
+        assert_eq!(outcome.json["label"], json!(SERVICE_LABEL));
+        assert!(outcome.summary.contains("NOT responding"));
+    }
+
+    #[test]
+    fn health_never_blocks_past_the_probe_timeout() {
+        // Same unrouted-loopback hang guard as probe_resolve (#502) — the health fetch is bounded.
+        let cfg = Config {
+            http_port: 59_135,
+            http_fallback_port: 59_136,
+            ..Config::default()
+        };
+        let start = std::time::Instant::now();
+        let _ = health(&cfg).unwrap();
+        assert!(start.elapsed() < (PROBE_TIMEOUT * 2) + Duration::from_secs(1));
     }
 
     #[test]

@@ -54,6 +54,9 @@
 //! - [`state`] — the machine-wide, identity-independent service state dir (`%PROGRAMDATA%\DigDns`
 //!   / `/var/lib/dig-dns` / `/Library/Application Support/DigDns`, `DIG_DNS_STATE_DIR` override)
 //!   + the runtime-info file the CLI reads to locate the running service regardless of user.
+//! - [`system_tool`] — trusted absolute-path resolution of OS tools for elevated spawns (#657):
+//!   the single anti-search-order-hijack chokepoint every `sc`/`net`/`systemctl`/`launchctl`/
+//!   `id`/`powershell`/`reg` spawn routes through.
 //! - [`cli`] — the `dig-dns` binary's command surface (grows per phase).
 //!
 //! `doctor` (Phase 4) + the PAC CLI (Phase 5) land in later phases, composing these modules;
@@ -79,6 +82,7 @@ pub mod server;
 pub mod service;
 pub mod service_run;
 pub mod state;
+pub mod system_tool;
 pub mod transport;
 
 /// The Windows Service Control Protocol entrypoint (Windows only): the `run-service` subcommand

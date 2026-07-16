@@ -96,6 +96,14 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Query the running service's machine-readable health (the same object the gateway serves at
+    /// `GET /.dig/health`: version, bound port, listeners, node reachability). Exits non-zero when
+    /// nothing is serving. The CLI counterpart of the HTTP control endpoint (§6.2 parity).
+    Health {
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Resolve a single `.dig` resource through the gateway pipeline and print it. Accepts a
     /// bare host (`<label>.dig`), a `host/path`, or a full `http://<label>.dig/path` URL.
     Fetch {
@@ -247,6 +255,7 @@ where
         | Command::Start { .. }
         | Command::Stop { .. }
         | Command::Status { .. }
+        | Command::Health { .. }
         | Command::ConfigureOs { .. }
         | Command::UnconfigureOs { .. } => {
             Err("this command runs via the binary entrypoint, not execute()".to_string())
@@ -256,6 +265,7 @@ where
 
 /// Load the config from the environment, layering an explicit `--node` flag over it (the
 /// flag has the highest §5.3 precedence). A blank flag is ignored (⇒ use the ladder).
+/// The flag value is validated the same as environment values (SPEC §13.1).
 fn load_config(node_flag: Option<&str>) -> Result<config::Config, String> {
     let mut cfg = config::from_env(|k| std::env::var(k).ok()).map_err(|e| e.to_string())?;
     if let Some(url) = node_flag {
@@ -263,6 +273,8 @@ fn load_config(node_flag: Option<&str>) -> Result<config::Config, String> {
             cfg.node_url = Some(url.trim().to_string());
         }
     }
+    // Re-validate after applying the flag to ensure it meets the same guard (SPEC §13.1).
+    cfg.validate().map_err(|e| e.to_string())?;
     Ok(cfg)
 }
 
@@ -453,6 +465,24 @@ pub fn run() -> std::process::ExitCode {
                 Err(e) => return fail(&e),
             };
             match crate::service::status(&cfg) {
+                Ok(out) => {
+                    let serving = out.json["serving"].as_bool().unwrap_or(false);
+                    print_service_outcome(&out, *json);
+                    if serving {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    }
+                }
+                Err(e) => fail(&e.to_string()),
+            }
+        }
+        Command::Health { json } => {
+            let cfg = match load_config(None) {
+                Ok(c) => c,
+                Err(e) => return fail(&e),
+            };
+            match crate::service::health(&cfg) {
                 Ok(out) => {
                     let serving = out.json["serving"].as_bool().unwrap_or(false);
                     print_service_outcome(&out, *json);
@@ -710,5 +740,41 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("loopback"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn load_config_rejects_flag_with_control_characters() {
+        // Regression test for dig_ecosystem #565: the --node flag must validate the same way
+        // the env path does (SPEC §13.1). An embedded newline / control character is rejected
+        // (would otherwise inject a systemd directive into the root unit).
+        // Without the fix, this flag value bypasses is_safe_node_url and reaches the config.
+        let err = load_config(Some("http://x\nExecStartPre=/bin/rm -rf /")).unwrap_err();
+        assert!(
+            err.contains("control character"),
+            "expected control-char rejection; got {err}"
+        );
+    }
+
+    #[test]
+    fn load_config_accepts_flag_without_control_characters() {
+        // The flag path should accept a valid node URL after validation.
+        let cfg = load_config(Some("http://localhost:9778")).unwrap();
+        assert_eq!(cfg.node_url.as_deref(), Some("http://localhost:9778"));
+    }
+
+    #[test]
+    fn load_config_rejects_flag_with_other_control_chars() {
+        // Also test other control characters: tab, carriage return, DEL.
+        for hostile in [
+            "http://x\tx",        // tab
+            "http://x\rDNS=evil", // carriage return
+            "http://x\x7fx",      // DEL
+        ] {
+            let err = load_config(Some(hostile)).unwrap_err();
+            assert!(
+                err.contains("control character"),
+                "expected control-char rejection for {hostile:?}; got {err}"
+            );
+        }
     }
 }

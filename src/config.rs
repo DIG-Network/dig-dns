@@ -112,6 +112,20 @@ pub enum ConfigError {
     /// The TLD normalised to an empty string.
     #[error("TLD must not be empty")]
     EmptyTld,
+    /// The TLD contained a character outside the safe `[a-z0-9-]` charset. Rejected as
+    /// defense-in-depth (dig_ecosystem #538): the tld flows UNESCAPED into elevated builders —
+    /// the NRPT PowerShell single-quoted arg, the macOS resolver PATH, and systemd/NM drop-in
+    /// bodies — so a `'`, `/`, `..`, or newline would be a latent root/LocalSystem injection sink
+    /// the moment a future config source is not env-only. A DNS label is `[a-z0-9-]` anyway.
+    #[error("TLD '{0}' must contain only lowercase letters, digits, and hyphens ([a-z0-9-])")]
+    InvalidTldCharset(String),
+    /// The node URL contained a control character (newline, etc.). Rejected as defense-in-depth
+    /// (dig_ecosystem #565): [`ENV_NODE_URL`] is baked UNESCAPED into the root systemd unit's
+    /// `Environment=DIG_NODE_URL=…` line ([`crate::service::build_plan`]), so an embedded newline
+    /// would inject a raw systemd directive (a second `ExecStartPre=`, etc.) into a unit that runs
+    /// as root. It is the identical latent sink [`InvalidTldCharset`] (#538) closed for the tld.
+    #[error("node URL '{0}' must not contain control characters or newlines")]
+    InvalidNodeUrl(String),
     /// [`ENV_SECURE_UPSTREAM`] was set to neither `on` nor `off`.
     #[error("DIG_DNS_SECURE_UPSTREAM: '{0}' is not 'on' or 'off'")]
     InvalidToggle(String),
@@ -159,16 +173,50 @@ impl Config {
         if self.tld.is_empty() {
             return Err(ConfigError::EmptyTld);
         }
+        if !is_safe_tld(&self.tld) {
+            return Err(ConfigError::InvalidTldCharset(self.tld.clone()));
+        }
+        if let Some(url) = &self.node_url {
+            if !is_safe_node_url(url) {
+                return Err(ConfigError::InvalidNodeUrl(url.clone()));
+            }
+        }
         Ok(())
     }
 }
 
 /// Normalise a TLD: trim whitespace, strip a single leading `.`, lowercase.
+///
+/// Normalisation is lexical only — it does NOT reject an out-of-charset tld. The charset guard
+/// ([`is_safe_tld`], enforced in [`Config::validate`]) is the security boundary; keeping the two
+/// separate lets callers normalise freely while every load path still validates before use.
 pub fn normalize_tld(raw: &str) -> String {
     raw.trim()
         .strip_prefix('.')
         .unwrap_or_else(|| raw.trim())
         .to_ascii_lowercase()
+}
+
+/// Is `tld` confined to the safe `[a-z0-9-]` charset? This is the defense-in-depth guard
+/// (dig_ecosystem #538) that keeps a metacharacter (`'`, `/`, `..`, a newline, `;`, `&`) out of
+/// the tld before it reaches any elevated builder (NRPT PowerShell, the macOS resolver PATH, a
+/// systemd/NetworkManager drop-in body). A real DNS label is `[a-z0-9-]` regardless, so this
+/// rejects nothing legitimate. Assumes `tld` is already lowercased by [`normalize_tld`].
+pub fn is_safe_tld(tld: &str) -> bool {
+    !tld.is_empty()
+        && tld
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Is `url` free of control characters (bytes `< 0x20`, i.e. newlines/tabs/etc., and `DEL`
+/// `0x7f`)? This is the defense-in-depth guard (dig_ecosystem #565) that keeps a raw newline out
+/// of the node URL before it is baked UNESCAPED into the root systemd unit's `Environment=` line
+/// ([`crate::service::build_plan`]) — an embedded `\n` would otherwise inject a second systemd
+/// directive (e.g. an `ExecStartPre=`) into a root-executed unit. A legitimate URL never contains
+/// a control character, so this rejects nothing valid. Mirrors [`is_safe_tld`] (#538).
+pub fn is_safe_node_url(url: &str) -> bool {
+    !url.bytes().any(|b| b < 0x20 || b == 0x7f)
 }
 
 /// Resolve the dig-node endpoint override by precedence: CLI flag > env > file config.
@@ -397,6 +445,16 @@ mod tests {
     }
 
     #[test]
+    fn from_env_rejects_a_hostile_tld_via_the_charset_guard() {
+        // The env load path MUST run the charset guard (dig_ecosystem #538) — a metacharacter tld
+        // set via DIG_DNS_TLD is refused at load, never reaching a builder.
+        assert!(matches!(
+            from_env(env_of(&[(ENV_TLD, "dig'; reboot")])).unwrap_err(),
+            ConfigError::InvalidTldCharset(_)
+        ));
+    }
+
+    #[test]
     fn normalize_tld_strips_dot_and_lowercases() {
         assert_eq!(normalize_tld(".DIG"), "dig");
         assert_eq!(normalize_tld("  Dig  "), "dig");
@@ -432,5 +490,91 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(c.validate(), Err(ConfigError::EmptyTld));
+    }
+
+    #[test]
+    fn validate_rejects_tld_with_injection_metacharacters() {
+        // dig_ecosystem #538: a tld carrying a metacharacter must be refused BEFORE it can reach
+        // an elevated builder. Each of these would arm a distinct injection sink if it flowed
+        // through unescaped — a PowerShell single-quote break, a resolver-PATH traversal, a
+        // systemd drop-in newline, a shell separator.
+        for hostile in [
+            "dig'; rm -rf /",   // PowerShell single-quoted-arg break (NRPT → LocalSystem)
+            "../etc/passwd",    // macOS resolver PATH traversal (arbitrary root file write)
+            "dig\nDNS=1.1.1.1", // systemd/NM drop-in body newline injection
+            "dig;reboot",       // shell separator
+            "dig space",        // whitespace is not a DNS label char
+            "DIG",              // uppercase never survives normalize_tld; refused if forced in
+        ] {
+            let c = Config {
+                tld: hostile.to_string(),
+                ..Config::default()
+            };
+            assert_eq!(
+                c.validate(),
+                Err(ConfigError::InvalidTldCharset(hostile.to_string())),
+                "tld {hostile:?} must be rejected by the charset guard"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_node_url_with_control_characters() {
+        // dig_ecosystem #565: a node URL is baked UNESCAPED into the root systemd unit's
+        // Environment= line, so a control char (newline/CR/tab/DEL) would inject a raw systemd
+        // directive into a root-executed unit. Refuse it at load, before it can reach the builder.
+        for hostile in [
+            "http://n\nExecStartPre=/bin/rm -rf /", // newline → a second systemd directive
+            "http://n\rDNS=evil",                   // carriage return
+            "http://n\tx",                          // tab
+            "http://n\x7fx",                        // DEL
+        ] {
+            let c = Config {
+                node_url: Some(hostile.to_string()),
+                ..Config::default()
+            };
+            assert_eq!(
+                c.validate(),
+                Err(ConfigError::InvalidNodeUrl(hostile.to_string())),
+                "node_url {hostile:?} must be rejected by the control-char guard"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_plain_node_url() {
+        for ok in [
+            "http://localhost:9778",
+            "https://rpc.dig.net",
+            "http://dig.local",
+        ] {
+            let c = Config {
+                node_url: Some(ok.to_string()),
+                ..Config::default()
+            };
+            assert_eq!(c.validate(), Ok(()), "node_url {ok:?} is a valid endpoint");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_plain_dns_label_tld() {
+        for ok in ["dig", "web3", "my-tld", "a1b2"] {
+            let c = Config {
+                tld: ok.to_string(),
+                ..Config::default()
+            };
+            assert_eq!(c.validate(), Ok(()), "tld {ok:?} is a valid DNS label");
+        }
+    }
+
+    #[test]
+    fn is_safe_tld_matches_the_dns_label_charset() {
+        assert!(is_safe_tld("dig"));
+        assert!(is_safe_tld("web3-x"));
+        assert!(!is_safe_tld(""));
+        assert!(!is_safe_tld("has space"));
+        assert!(!is_safe_tld("quote'"));
+        assert!(!is_safe_tld("slash/"));
+        assert!(!is_safe_tld("dot.dot"));
     }
 }

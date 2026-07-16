@@ -55,6 +55,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::config::Config;
+use crate::system_tool::resolve_system_tool;
 
 /// The marker stamped into every artifact `configure-os` writes, so `unconfigure-os` recognises —
 /// and only removes — what THIS tool added.
@@ -816,6 +817,12 @@ fn elevation_message() -> String {
 
 /// Write `content` to `path` only if it differs from what's already there (idempotent), creating
 /// parent dirs as needed. `Ok(true)` iff a write happened.
+///
+/// The write itself is symlink-safe + atomic ([`atomic_write`], dig_ecosystem #650): every path
+/// this runs against is a compiled-in root-owned `/etc/**` policy/resolver file, written as root,
+/// so a temp-file-then-`rename` (which replaces a target symlink instead of following it) plus
+/// `O_NOFOLLOW` on the temp create is the correct hardened pattern for a privileged writer — a
+/// reader never observes a half-written file, and a pre-seeded symlink can never redirect the write.
 fn write_if_changed(path: &Path, content: &str) -> Result<bool, String> {
     if let Ok(existing) = std::fs::read_to_string(path) {
         if existing == content {
@@ -825,8 +832,57 @@ fn write_if_changed(path: &Path, content: &str) -> Result<bool, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
+    atomic_write(path, content)?;
     Ok(true)
+}
+
+/// Symlink-safe, atomic write of `content` to `path` (dig_ecosystem #650).
+///
+/// On Unix: write to a sibling temp file opened `O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW` (so a planted
+/// temp symlink cannot redirect the bytes and a stale temp is never silently reused), `fsync` it,
+/// then `rename` it over `path`. `rename(2)` replaces a symlink AT the destination rather than
+/// following it, so even if an attacker pre-seeded `path` as a symlink the final file lands where
+/// intended, atomically. On non-Unix this is a plain `fs::write` (no elevated `/etc` writer exists
+/// there — the Windows path wires the resolver via NRPT/registry, not file writes).
+pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("{}: no parent directory", path.display()))?;
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| format!("{}: no file name", path.display()))?;
+        let tmp = parent.join(format!(".{file_name}.dig-dns.{}.tmp", std::process::id()));
+
+        // O_EXCL: fail rather than reuse/follow a pre-existing temp. O_NOFOLLOW: never open through
+        // a symlink at the temp path. 0o644 mirrors a normal /etc policy file's mode.
+        let open = || -> std::io::Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .mode(0o644)
+                .open(&tmp)?;
+            f.write_all(content.as_bytes())?;
+            f.sync_all()?;
+            Ok(())
+        };
+        open().map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("install {}: {e}", path.display()));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))
+    }
 }
 
 /// Does `path` hold content this tool (or the legacy installer) owns? A missing/unreadable file
@@ -878,51 +934,6 @@ fn run_ps(command: &str) -> Result<(), String> {
     } else {
         Err("powershell exited non-zero".to_string())
     }
-}
-
-/// Resolve a known system tool's bare name to a trusted ABSOLUTE path, so an elevated spawn can
-/// never be hijacked by a `PATH`-planted binary (dig_ecosystem #565/#657). The result is ALWAYS
-/// absolute — an unknown name or a not-found tool falls back to the first canonical candidate
-/// (still absolute), never the bare name.
-///
-/// - Windows: built under `%SystemRoot%\System32` (PowerShell under its `WindowsPowerShell\v1.0`).
-/// - Unix: the first existing candidate across the canonical `/usr/bin`, `/bin`, `/usr/sbin`,
-///   `/sbin` locations, else the first candidate.
-fn resolve_system_tool(name: &str) -> String {
-    #[cfg(windows)]
-    {
-        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-        let system32 = format!(r"{system_root}\System32");
-        match name {
-            "powershell" => format!(r"{system32}\WindowsPowerShell\v1.0\powershell.exe"),
-            "net" => format!(r"{system32}\net.exe"),
-            "reg" => format!(r"{system32}\reg.exe"),
-            other => format!(r"{system32}\{other}.exe"),
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let candidates = system_tool_candidates(name);
-        candidates
-            .iter()
-            .find(|p| Path::new(p).exists())
-            .cloned()
-            .unwrap_or_else(|| candidates[0].clone())
-    }
-}
-
-/// The canonical absolute-path candidates for a Unix system tool, most-preferred first. Every
-/// candidate is absolute, so the [`resolve_system_tool`] fallback stays absolute. PURE.
-#[cfg(not(windows))]
-fn system_tool_candidates(name: &str) -> Vec<String> {
-    let dirs: &[&str] = match name {
-        // networking tools live in the sbin dirs on macOS/BSD
-        "ifconfig" => &["/sbin", "/usr/sbin"],
-        // launchctl is macOS-only, in /bin
-        "launchctl" => &["/bin", "/usr/bin"],
-        _ => &["/usr/bin", "/bin", "/usr/sbin", "/sbin"],
-    };
-    dirs.iter().map(|d| format!("{d}/{name}")).collect()
 }
 
 /// Run `reg <args…>`, discarding output. `Ok(())` iff it exits 0.
@@ -1342,6 +1353,57 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn atomic_write_replaces_a_symlink_target_instead_of_following_it() {
+        // dig_ecosystem #650: if the target path is (or is pre-seeded as) a symlink, the hardened
+        // writer must NOT write through it to the link's target — the `rename` must replace the
+        // symlink itself, leaving the pointed-at file untouched.
+        use std::os::unix::fs::symlink;
+        let dir = tmp_subdir("atomic-symlink");
+        let victim = dir.join("victim.conf");
+        std::fs::write(&victim, "ORIGINAL-VICTIM\n").unwrap();
+        let target = dir.join("dig.conf");
+        symlink(&victim, &target).unwrap(); // target -> victim (the classic redirect attack)
+
+        assert!(write_if_changed(&target, "DIG-CONTENT\n").unwrap());
+
+        // The victim the symlink pointed at is untouched…
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "ORIGINAL-VICTIM\n"
+        );
+        // …and the target is now a REAL file with our content, no longer a symlink.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "DIG-CONTENT\n");
+        assert!(!std::fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn atomic_write_leaves_no_temp_files_behind() {
+        // The temp file must be renamed away (or cleaned on failure) — a successful write leaves
+        // exactly the one target file in the directory.
+        let dir = tmp_subdir("atomic-clean");
+        let p = dir.join("dig.conf");
+        assert!(write_if_changed(&p, "x\n").unwrap());
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the target should remain: {entries:?}"
+        );
+        assert_eq!(entries[0], std::ffi::OsStr::new("dig.conf"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn remove_if_ours_only_deletes_marked_or_legacy_files() {
         let dir = tmp_subdir("remove-ours");
         let ours = dir.join("ours.conf");
@@ -1560,43 +1622,8 @@ mod tests {
         assert!(!json.contains("reboot_reason"));
     }
 
-    #[cfg(not(windows))]
-    #[test]
-    fn resolve_system_tool_returns_absolute_paths_never_bare_names() {
-        for tool in [
-            "systemctl",
-            "resolvectl",
-            "ifconfig",
-            "dscacheutil",
-            "killall",
-            "id",
-        ] {
-            let resolved = resolve_system_tool(tool);
-            assert!(
-                resolved.starts_with('/'),
-                "{tool} resolved to a non-absolute path: {resolved}"
-            );
-            assert!(resolved.ends_with(tool));
-        }
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn ifconfig_prefers_the_sbin_locations() {
-        let candidates = system_tool_candidates("ifconfig");
-        assert_eq!(candidates[0], "/sbin/ifconfig");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn resolve_system_tool_builds_absolute_system32_paths() {
-        let ps = resolve_system_tool("powershell");
-        assert!(ps.contains(r"\System32\WindowsPowerShell\v1.0\powershell.exe"));
-        // Backed by %SystemRoot% (or the C:\Windows fallback) — always an absolute drive path.
-        assert!(ps.contains(":\\"));
-        assert!(resolve_system_tool("net").ends_with(r"\System32\net.exe"));
-        assert!(resolve_system_tool("reg").ends_with(r"\System32\reg.exe"));
-    }
+    // The trusted system-tool resolver itself is tested in `crate::system_tool` (dig_ecosystem
+    // #657); os_config only consumes it via `resolve_system_tool`.
 
     #[test]
     fn unconfigure_plans_remove_and_record_into_the_removed_bucket() {
