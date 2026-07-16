@@ -119,6 +119,13 @@ pub enum ConfigError {
     /// the moment a future config source is not env-only. A DNS label is `[a-z0-9-]` anyway.
     #[error("TLD '{0}' must contain only lowercase letters, digits, and hyphens ([a-z0-9-])")]
     InvalidTldCharset(String),
+    /// The node URL contained a control character (newline, etc.). Rejected as defense-in-depth
+    /// (dig_ecosystem #565): [`ENV_NODE_URL`] is baked UNESCAPED into the root systemd unit's
+    /// `Environment=DIG_NODE_URL=…` line ([`crate::service::build_plan`]), so an embedded newline
+    /// would inject a raw systemd directive (a second `ExecStartPre=`, etc.) into a unit that runs
+    /// as root. It is the identical latent sink [`InvalidTldCharset`] (#538) closed for the tld.
+    #[error("node URL '{0}' must not contain control characters or newlines")]
+    InvalidNodeUrl(String),
     /// [`ENV_SECURE_UPSTREAM`] was set to neither `on` nor `off`.
     #[error("DIG_DNS_SECURE_UPSTREAM: '{0}' is not 'on' or 'off'")]
     InvalidToggle(String),
@@ -169,6 +176,11 @@ impl Config {
         if !is_safe_tld(&self.tld) {
             return Err(ConfigError::InvalidTldCharset(self.tld.clone()));
         }
+        if let Some(url) = &self.node_url {
+            if !is_safe_node_url(url) {
+                return Err(ConfigError::InvalidNodeUrl(url.clone()));
+            }
+        }
         Ok(())
     }
 }
@@ -195,6 +207,16 @@ pub fn is_safe_tld(tld: &str) -> bool {
         && tld
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Is `url` free of control characters (bytes `< 0x20`, i.e. newlines/tabs/etc., and `DEL`
+/// `0x7f`)? This is the defense-in-depth guard (dig_ecosystem #565) that keeps a raw newline out
+/// of the node URL before it is baked UNESCAPED into the root systemd unit's `Environment=` line
+/// ([`crate::service::build_plan`]) — an embedded `\n` would otherwise inject a second systemd
+/// directive (e.g. an `ExecStartPre=`) into a root-executed unit. A legitimate URL never contains
+/// a control character, so this rejects nothing valid. Mirrors [`is_safe_tld`] (#538).
+pub fn is_safe_node_url(url: &str) -> bool {
+    !url.bytes().any(|b| b < 0x20 || b == 0x7f)
 }
 
 /// Resolve the dig-node endpoint override by precedence: CLI flag > env > file config.
@@ -493,6 +515,44 @@ mod tests {
                 Err(ConfigError::InvalidTldCharset(hostile.to_string())),
                 "tld {hostile:?} must be rejected by the charset guard"
             );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_node_url_with_control_characters() {
+        // dig_ecosystem #565: a node URL is baked UNESCAPED into the root systemd unit's
+        // Environment= line, so a control char (newline/CR/tab/DEL) would inject a raw systemd
+        // directive into a root-executed unit. Refuse it at load, before it can reach the builder.
+        for hostile in [
+            "http://n\nExecStartPre=/bin/rm -rf /", // newline → a second systemd directive
+            "http://n\rDNS=evil",                   // carriage return
+            "http://n\tx",                          // tab
+            "http://n\x7fx",                        // DEL
+        ] {
+            let c = Config {
+                node_url: Some(hostile.to_string()),
+                ..Config::default()
+            };
+            assert_eq!(
+                c.validate(),
+                Err(ConfigError::InvalidNodeUrl(hostile.to_string())),
+                "node_url {hostile:?} must be rejected by the control-char guard"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_plain_node_url() {
+        for ok in [
+            "http://localhost:9778",
+            "https://rpc.dig.net",
+            "http://dig.local",
+        ] {
+            let c = Config {
+                node_url: Some(ok.to_string()),
+                ..Config::default()
+            };
+            assert_eq!(c.validate(), Ok(()), "node_url {ok:?} is a valid endpoint");
         }
     }
 

@@ -605,12 +605,24 @@ interchangeable and idempotent (the clean-reinstall, §13.2, makes a re-run safe
   matching the `.deb`. The service runs as root with a bounded capability set —
   `AmbientCapabilities`/`CapabilityBoundingSet=CAP_NET_BIND_SERVICE`, `NoNewPrivileges`,
   `ProtectSystem=full`, `ProtectHome=read-only`, `PrivateTmp` — and NO dedicated
-  `User=`/`DynamicUser=`, so its `ExecStart` can reach the binary in ANY install dir (including a
-  home dir like `~/.dig/bin`) without the `203/EXEC` traversal failure a restricted service account
-  hits (#528). `ProtectHome` is `read-only` rather than `true` precisely so a binary under a home
-  dir stays readable+executable to the service while home writes remain blocked. macOS remains a
-  user-domain launchd agent (no elevation required); Windows remains system-scope SCM (elevation
-  required).
+  `User=`/`DynamicUser=` (the `.deb` runs as root too).
+  **The install COPIES the `dig-dns` binary into the root-owned directory
+  `/usr/local/lib/dig-dns/` (`chown root:root`, `0755`) and points the unit's `ExecStart` at that
+  COPY (#565).** A root-executed unit MUST NEVER `ExecStart` a user-writable path: the install
+  fails closed (`PermissionDenied`) unless both the staged binary and its directory are root-owned
+  and not group/world-writable. This closes the local-privilege-escalation where `sudo dig-dns
+  install` would otherwise bake `current_exe()` (a user-writable `~/.dig/bin/dig-dns`) into a
+  root unit, letting any later unprivileged write to that path execute as root at the next service
+  restart. `ProtectHome` stays `read-only` (rather than `true`) as a harmless defensive default —
+  the service holds no secret material and never writes a home dir. macOS remains a user-domain
+  launchd agent (no elevation required); Windows remains system-scope SCM (elevation required).
+- **The unit-file write is symlink-safe + atomic (#650).** The Linux backend writes
+  `/etc/systemd/system/net.dignetwork.dig-dns.service` via the `O_NOFOLLOW`-temp-then-`rename`
+  writer, so a pre-seeded symlink at the unit path can never redirect the root write.
+- **Values baked into the unit are validated at config load.** `DIG_NODE_URL` (and every value
+  written into an `Environment=` line) is rejected if it contains a control character/newline
+  (#565), mirroring the TLD charset guard (#538) — an embedded newline would otherwise inject a
+  raw systemd directive into the root unit.
 - The **display name** is the human-friendly name shown in the Windows Services console. On
   Windows it is set with `sc config <id> displayname= "DIG NETWORK: DNS"` AFTER create (the
   underlying `sc create` sets the display name to the id). On launchd/systemd the service id is

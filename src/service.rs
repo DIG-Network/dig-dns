@@ -475,18 +475,113 @@ fn linux_unit_file_path() -> PathBuf {
     PathBuf::from(LINUX_UNIT_DIR).join(LINUX_UNIT_FILE_NAME)
 }
 
+/// The ROOT-OWNED directory the CLI install COPIES the `dig-dns` binary into before pointing the
+/// root systemd unit's `ExecStart` at it (dig_ecosystem #565). `/usr/local/lib` is the standard
+/// root-owned prefix for machine-local software; a non-root user cannot write there.
+#[cfg(all(unix, not(target_os = "macos")))]
+const LINUX_PROGRAM_DIR: &str = "/usr/local/lib/dig-dns";
+
+/// The file name of the copied binary inside [`LINUX_PROGRAM_DIR`].
+#[cfg(all(unix, not(target_os = "macos")))]
+const LINUX_PROGRAM_NAME: &str = "dig-dns";
+
+/// The absolute path of the root-owned binary copy the Linux unit's `ExecStart` targets. PURE —
+/// a FIXED root-owned location, deliberately INDEPENDENT of `current_exe()` so the unit can never
+/// exec a user-writable path. This is the #565 LPE fix: the prior design baked `current_exe()`
+/// (which #528 pointed at a user-writable `~/.dig/bin/dig-dns`) verbatim into a root unit, so any
+/// later write to that home path by the unprivileged user became persistent root RCE at the next
+/// service restart. Copying into a root-owned dir + verifying ownership closes that door.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_program_dest() -> PathBuf {
+    PathBuf::from(LINUX_PROGRAM_DIR).join(LINUX_PROGRAM_NAME)
+}
+
+/// Is a filesystem entry with owner `uid` and permission `mode` safe to exec as root — i.e.
+/// root-owned AND not group/world-writable? PURE (takes the stat fields), so both the accept and
+/// reject arms are unit-tested without needing a real root-owned file. `mode & 0o022` is the
+/// group-write (`0o020`) + other-write (`0o002`) bits; either being set means a non-owner could
+/// replace/modify the target, so a root unit must refuse it (dig_ecosystem #565).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn root_owned_not_writable(uid: u32, mode: u32) -> bool {
+    uid == 0 && (mode & 0o022) == 0
+}
+
+/// Fail-closed guard: error unless `path` (via `symlink_metadata`, so a symlink is judged on its
+/// OWN ownership, never its target) is root-owned and not group/world-writable. Used to VERIFY the
+/// staged binary + its directory before a root unit is allowed to exec them (#565). Mirrors the
+/// sibling ownership guards in dig-node (`resolve_privileged_sibling`) and dig-installer
+/// (`protected_bin_dir`).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn ensure_root_owned_not_writable(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::symlink_metadata(path)?;
+    if !root_owned_not_writable(meta.uid(), meta.mode()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "dig-dns: refusing to install a root service that execs {} — it must be owned by \
+                 root (uid 0) and not group/world-writable, but it is owned by uid {} with mode \
+                 {:o}. Install dig-dns to a root-owned prefix and retry.",
+                path.display(),
+                meta.uid(),
+                meta.mode() & 0o7777,
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Stage the running binary into the ROOT-OWNED [`LINUX_PROGRAM_DIR`] and return the destination
+/// path the root systemd unit's `ExecStart` will target (dig_ecosystem #565). Runs as root (the
+/// install entrypoint has already verified elevation). The copy — rather than baking
+/// `current_exe()` — is what guarantees the unit never execs a user-writable binary as root:
+///
+/// 1. create [`LINUX_PROGRAM_DIR`], `chown root:root`, `0755`;
+/// 2. remove any pre-existing destination (via `remove_file`, which unlinks a planted symlink
+///    instead of following it) and copy the current binary in;
+/// 3. `chown root:root` + `0755` the copy;
+/// 4. VERIFY (fail-closed) both the directory and the copied file are root-owned + not
+///    group/world-writable before returning — so a hostile pre-seeded dir/symlink is caught.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn stage_service_program() -> io::Result<PathBuf> {
+    use std::fs::Permissions;
+    use std::os::unix::fs::{chown, PermissionsExt};
+
+    let source = std::env::current_exe()?;
+    let dir = PathBuf::from(LINUX_PROGRAM_DIR);
+    std::fs::create_dir_all(&dir)?;
+    chown(&dir, Some(0), Some(0))?;
+    std::fs::set_permissions(&dir, Permissions::from_mode(0o755))?;
+
+    let dest = linux_program_dest();
+    // Unlink any existing entry first: remove_file removes a symlink itself (never its target), so
+    // a pre-seeded symlink at `dest` cannot redirect the copy into an attacker-controlled path.
+    let _ = std::fs::remove_file(&dest);
+    std::fs::copy(&source, &dest)?;
+    chown(&dest, Some(0), Some(0))?;
+    std::fs::set_permissions(&dest, Permissions::from_mode(0o755))?;
+
+    // Fail closed: NEVER hand a non-root-owned or writable path to a root unit's ExecStart.
+    ensure_root_owned_not_writable(&dir)?;
+    ensure_root_owned_not_writable(&dest)?;
+    Ok(dest)
+}
+
 /// Build the systemd unit contents for a CLI install from the resolved [`InstallPlan`]. PURE (no
 /// I/O), so the exact unit body is unit-tested.
 ///
-/// **#528 — runs as root with a bounded capability set, so `ExecStart` succeeds from ANY bin dir.**
-/// The service runs as root (no `User=`/`DynamicUser=`), exactly like the `.deb` unit
-/// ([`crate::packaging::systemd_unit`]): a dedicated unprivileged account cannot traverse into a
-/// user's `0750` home to `execve` a binary under `~/.dig/bin` (systemd `203/EXEC`), whereas root
-/// can exec from any install location. The privilege is then narrowed to exactly what binding
-/// `:53`/`:80` needs — `AmbientCapabilities`/`CapabilityBoundingSet=CAP_NET_BIND_SERVICE`,
-/// `NoNewPrivileges`, `ProtectSystem`/`ProtectHome`/`PrivateTmp` — a loopback-only service holding
-/// no secret material. The resolved config is baked in as `Environment=` lines so the unit serves
-/// identically to the invoking `dig-dns serve`.
+/// **Runs as root, execing a ROOT-OWNED binary copy.** The service runs as root (no
+/// `User=`/`DynamicUser=`), exactly like the `.deb` unit ([`crate::packaging::systemd_unit`]): a
+/// dedicated unprivileged account cannot traverse into a user's `0750` home to `execve` a binary
+/// (systemd `203/EXEC`), whereas root can exec from a system install location. To avoid the #565
+/// local-privilege-escalation (a root unit must NEVER exec a user-writable path), the install
+/// COPIES the binary into the root-owned [`LINUX_PROGRAM_DIR`] and points `ExecStart` there — so
+/// `plan.program` is always a root-owned path, never `current_exe()`. The privilege is then
+/// narrowed to exactly what binding `:53`/`:80` needs — `AmbientCapabilities`/
+/// `CapabilityBoundingSet=CAP_NET_BIND_SERVICE`, `NoNewPrivileges`, `ProtectSystem`/`ProtectHome`/
+/// `PrivateTmp` — a loopback-only service holding no secret material. The resolved config is baked
+/// in as `Environment=` lines so the unit serves identically to the invoking `dig-dns serve`.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn linux_unit_contents(plan: &InstallPlan) -> String {
     use crate::packaging::NET_BIND_CAPABILITY;
@@ -521,16 +616,15 @@ fn linux_unit_contents(plan: &InstallPlan) -> String {
          ExecStart={program} {exec_args}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
-         # Runs as root so ExecStart can reach the binary in ANY install dir (#528); privilege is\n\
+         # Runs as root so ExecStart can reach the root-owned binary copy (#565); privilege is\n\
          # then bounded to exactly the loopback :53/:80 bind (#177).\n\
          AmbientCapabilities={NET_BIND_CAPABILITY}\n\
          CapabilityBoundingSet={NET_BIND_CAPABILITY}\n\
          StateDirectory=dig-dns\n\
          NoNewPrivileges=true\n\
          ProtectSystem=full\n\
-         # read-only (NOT true): the CLI-installed binary may live under a home dir (e.g.\n\
-         # ~/.dig/bin, #528), which ProtectHome=true would hide from the service, breaking\n\
-         # ExecStart; read-only still lets it READ+EXEC the binary while blocking writes to home.\n\
+         # read-only: the service holds no secret material and never needs to write a home dir;\n\
+         # read-only blocks writes while still allowing reads, a harmless defensive default (#528).\n\
          ProtectHome=read-only\n\
          PrivateTmp=true\n\
          {env_lines}\
@@ -601,7 +695,11 @@ impl ServiceBackend for SystemServiceBackend {
     }
 
     fn create(&self, plan: &InstallPlan) -> io::Result<()> {
-        std::fs::write(&self.unit_path, linux_unit_contents(plan))?;
+        // Write the unit via the symlink-safe atomic writer (#650): O_NOFOLLOW temp create +
+        // rename-over, so a pre-seeded symlink at the unit path can never redirect this root write
+        // (consistent with the resolver-file writer in `os_config`).
+        crate::os_config::atomic_write(&self.unit_path, &linux_unit_contents(plan))
+            .map_err(io::Error::other)?;
         Self::systemctl(&["daemon-reload"])?;
         if plan.autostart {
             Self::systemctl(&["enable", LINUX_UNIT_FILE_NAME])?;
@@ -653,13 +751,26 @@ fn set_windows_display_name(service_name: &str, display_name: &str) {
 /// Install `dig-dns` as an auto-starting OS service via the clean-reinstall contract (stop →
 /// delete → recreate on an existing service; create otherwise). The service runs `dig-dns
 /// serve` (or `run-service` on Windows) with the resolved `config` baked into its environment.
+/// Resolve the program path the installed service will exec. On Linux the binary is COPIED into a
+/// root-owned dir first and THAT path is used (dig_ecosystem #565 — never exec a user-writable
+/// binary as root); every other platform runs `current_exe()` directly (Windows SCM installs from
+/// a root-owned Program Files path; macOS installs a user-domain agent, no root exec).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn resolve_install_program() -> io::Result<PathBuf> {
+    stage_service_program()
+}
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn resolve_install_program() -> io::Result<PathBuf> {
+    std::env::current_exe()
+}
+
 pub fn install(config: &Config) -> io::Result<ServiceOutcome> {
     if INSTALL_REQUIRES_ELEVATION && !has_required_elevation() {
         return Err(elevation_refusal("installing"));
     }
 
     let backend = SystemServiceBackend::new()?;
-    let program = std::env::current_exe()?;
+    let program = resolve_install_program()?;
     let plan = build_plan(config, program.clone());
     let report = reinstall(&backend, &plan)?;
 
@@ -974,33 +1085,89 @@ mod tests {
     #[test]
     #[cfg(all(unix, not(target_os = "macos")))]
     fn linux_unit_contents_run_as_root_with_bounded_capability_and_baked_env() {
-        // dig_ecosystem #528: the unit runs as root (no User=/DynamicUser=, so ExecStart can reach
-        // a binary under a 0750 home like ~/.dig/bin), bounded to CAP_NET_BIND_SERVICE, with the
-        // resolved config baked as Environment= lines and the ExecStart pointing at the installed
-        // program.
+        // The unit runs as root (no User=/DynamicUser=, so ExecStart can reach the system binary),
+        // bounded to CAP_NET_BIND_SERVICE, with the resolved config baked as Environment= lines and
+        // ExecStart pointing at the root-owned staged binary (#565), never at current_exe().
         let config = Config {
             http_port: 8080,
             tld: "dig".to_string(),
             ..Config::default()
         };
-        let plan = build_plan(&config, PathBuf::from("/home/alice/.dig/bin/dig-dns"));
+        let plan = build_plan(&config, linux_program_dest());
         let unit = linux_unit_contents(&plan);
 
-        assert!(unit.contains("ExecStart=/home/alice/.dig/bin/dig-dns serve"));
+        assert!(unit.contains("ExecStart=/usr/local/lib/dig-dns/dig-dns serve"));
         assert!(unit.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE"));
         assert!(unit.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE"));
         assert!(unit.contains("NoNewPrivileges=true"));
-        // ProtectHome MUST be read-only, not true: the binary may live under a home dir (#528),
-        // which ProtectHome=true would hide from the service and break ExecStart.
+        // ProtectHome stays read-only: a harmless defensive default for a service that holds no
+        // secret material and never writes a home dir (#528).
         assert!(unit.contains("ProtectHome=read-only"));
         assert!(!unit.contains("ProtectHome=true"));
-        // Runs as root: it must NOT drop to a dedicated account that can't traverse the home dir.
+        // Runs as root: it must NOT drop to a dedicated account (the .deb runs as root too).
         assert!(!unit.contains("User="));
         assert!(!unit.contains("DynamicUser="));
         // Baked config + autostart install section.
         assert!(unit.contains(&format!("Environment={}=8080", config::ENV_HTTP_PORT)));
         assert!(unit.contains("Environment=DIG_DNS_TLD=dig"));
         assert!(unit.contains("[Install]\nWantedBy=multi-user.target"));
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn linux_program_dest_is_a_fixed_root_owned_path_not_a_home_dir() {
+        // #565: the ExecStart target is a FIXED root-owned location, deliberately independent of
+        // current_exe() — so a root unit can never end up execing a user-writable ~/.dig/bin path.
+        let dest = linux_program_dest();
+        assert_eq!(dest, PathBuf::from("/usr/local/lib/dig-dns/dig-dns"));
+        assert!(dest.is_absolute());
+        let s = dest.to_string_lossy();
+        assert!(
+            s.starts_with("/usr/local/lib/"),
+            "must be under a root-owned prefix"
+        );
+        assert!(!s.contains("/home/"), "must never be a user home path");
+        assert!(
+            !s.contains(".dig/bin"),
+            "must never be the user-writable ~/.dig/bin path"
+        );
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn root_owned_not_writable_accepts_only_root_owned_unwritable_entries() {
+        // ACCEPT: root-owned (uid 0), no group/other write bits.
+        assert!(root_owned_not_writable(0, 0o755));
+        assert!(root_owned_not_writable(0, 0o644));
+        assert!(root_owned_not_writable(0, 0o700));
+        // REJECT: not root-owned — the LPE vector (a user-writable binary exec'd as root).
+        assert!(!root_owned_not_writable(1000, 0o755));
+        // REJECT: root-owned but group- or world-writable (a non-owner could replace it).
+        assert!(!root_owned_not_writable(0, 0o775)); // group-writable
+        assert!(!root_owned_not_writable(0, 0o757)); // world-writable
+        assert!(!root_owned_not_writable(0, 0o777));
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn ensure_root_owned_not_writable_rejects_a_user_owned_binary() {
+        // A file this (non-root) test process creates is owned by the test user, NOT root — the
+        // exact LPE condition #565 must refuse. Fails closed with PermissionDenied.
+        let dir = std::env::temp_dir().join(format!("dig-dns-own-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("dig-dns");
+        std::fs::write(&f, b"#!/bin/true\n").unwrap();
+
+        // Only meaningful when the test runs unprivileged (the common `cargo test` case): a root
+        // test runner would legitimately own the file. Assert the fail-closed reject otherwise.
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::metadata(&f).unwrap().uid() != 0 {
+            let err = ensure_root_owned_not_writable(&f)
+                .expect_err("a user-owned binary must be refused for a root unit");
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

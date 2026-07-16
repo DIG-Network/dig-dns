@@ -844,7 +844,7 @@ fn write_if_changed(path: &Path, content: &str) -> Result<bool, String> {
 /// following it, so even if an attacker pre-seeded `path` as a symlink the final file lands where
 /// intended, atomically. On non-Unix this is a plain `fs::write` (no elevated `/etc` writer exists
 /// there — the Windows path wires the resolver via NRPT/registry, not file writes).
-fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::io::Write;
