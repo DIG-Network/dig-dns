@@ -7,22 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.15.0] - 2026-07-16
 
 ### Features
-- **service:** Unify the Linux systemd unit name across the CLI-install path and the native `.deb`
-  under the canonical `net.dignetwork.dig-dns.service` (#523); the CLI Linux install is now
-  system-level (root) and manages the unit directly instead of via the `service-manager` crate.
-- **service:** Linux service runs as root with a bounded `CAP_NET_BIND_SERVICE` set (no dedicated
-  account), so `ExecStart` succeeds from any bin dir (e.g. `~/.dig/bin`) — fixes the `203/EXEC`
-  service-account traversal failure (#528).
-- **cli:** `dig-dns health` — CLI counterpart of the `/.dig/health` control endpoint, for machine-
-  consumable parity (#569).
-
-### Security
-- **config:** Constrain the TLD to `^[a-z0-9-]+$`, rejected at load — defense-in-depth against
-  injection into elevated OS-resolver builders (#538).
-- **os-config:** Route all elevated system-tool spawns (and `doctor` probes) through trusted
-  absolute paths; the Windows resolver now uses `GetSystemDirectoryW` (#657).
-- **os-config:** Symlink-safe atomic (`O_NOFOLLOW` + temp-rename) writes for the Linux `/etc`
-  policy/resolver writer (#650).
+- **dns:** Mop-up — canonical unit name, svc-account exec, tld guard, CLI parity, hardening (#23)
 
 ## [0.14.0] - 2026-07-16
 
