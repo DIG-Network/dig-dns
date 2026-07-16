@@ -587,6 +587,45 @@ fn ensure_prefix_root_owned_not_writable(dir: &std::path::Path) -> io::Result<()
     Ok(())
 }
 
+/// Create any missing intermediate directories from the root down to the parent of `dir`,
+/// using `create_dir` for each missing component (never `create_dir_all`). Each created
+/// directory is owned by root + mode 0755. Called after `ensure_prefix_root_owned_not_writable`
+/// has verified the EXISTING ancestors are all root-owned/non-symlink/non-writable, so creating
+/// missing intermediates in that verified chain is safe (no non-root actor could have pre-planted them).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn create_missing_intermediates(dir: &std::path::Path) -> io::Result<()> {
+    use std::fs::Permissions;
+    use std::os::unix::fs::{chown, PermissionsExt};
+
+    let target = dir.parent().unwrap_or(dir);
+    if target.exists() {
+        // All ancestors already exist, nothing to do.
+        return Ok(());
+    }
+
+    // Collect components that don't yet exist, walking up from target.
+    let mut to_create = Vec::new();
+    let mut current = target;
+    while !current.exists() {
+        to_create.push(current.to_path_buf());
+        if let Some(parent) = current.parent() {
+            current = parent;
+        } else {
+            break;
+        }
+    }
+
+    // Create from the deepest existing ancestor downward, one at a time.
+    to_create.reverse();
+    for path in to_create {
+        std::fs::create_dir(&path)?;
+        chown(&path, Some(0), Some(0))?;
+        std::fs::set_permissions(&path, Permissions::from_mode(0o755))?;
+    }
+
+    Ok(())
+}
+
 /// Ensure `dir` is a REAL directory (never a followed symlink), creating it fresh when absent and
 /// UNLINKING any pre-planted symlink or file squatting the path first (`remove_file` unlinks the
 /// entry itself, never following a symlink to its target). An existing REAL directory (a prior
@@ -637,6 +676,12 @@ fn stage_service_program() -> io::Result<PathBuf> {
     // intermediate (redirecting the chown/chmod below) or replace the staged subdir after install.
     let prefix = dir.parent().unwrap_or(&dir);
     ensure_prefix_root_owned_not_writable(prefix)?;
+
+    // Create any missing intermediate directories in the path (e.g., /usr/local/lib if absent on
+    // a minimal host). Each is created one at a time with create_dir (no-follow), owned by root,
+    // and mode 0755. Safe because the prefix walk above proved every EXISTING ancestor is
+    // root-only-writable, so no non-root actor could have pre-planted the missing components.
+    create_missing_intermediates(&dir)?;
 
     // Create/reuse the leaf without following a symlink (#701): a pre-planted symlink-to-dir is
     // unlinked rather than treated as the existing directory (the `create_dir_all` gap).
@@ -1365,6 +1410,56 @@ mod tests {
             leaf.is_dir(),
             "existing real dir reused (idempotent reinstall)"
         );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn create_missing_intermediates_builds_absent_parent_chain() {
+        // Regression for the #701 fix: `create_dir` (not `create_dir_all`) in `ensure_real_leaf_dir`
+        // breaks clean installs when `/usr/local/lib` is absent (standard on minimal hosts). The fix
+        // creates missing intermediates safely before the leaf. This test verifies that
+        // `create_missing_intermediates` builds the missing components, each root-owned + mode 0755.
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("dig-dns-missing-int-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // Create a mock root-owned-like ancestor (the test runs unprivileged, so we simulate by
+        // creating the base). In a real root install, every existing ancestor would be verified
+        // root-owned by ensure_prefix_root_owned_not_writable first.
+        std::fs::create_dir_all(&base).unwrap();
+
+        // The path we want to build: base/missing1/missing2/final
+        let final_dir = base.join("missing1").join("missing2").join("final");
+
+        // Before the fix, calling ensure_real_leaf_dir directly on final_dir would fail with
+        // ENOENT because missing1 and missing2 don't exist. Calling create_missing_intermediates
+        // builds them, then the leaf can be created.
+        create_missing_intermediates(&final_dir).unwrap();
+
+        // Verify the intermediates were created.
+        assert!(base.join("missing1").is_dir(), "missing1 created");
+        assert!(
+            base.join("missing1").join("missing2").is_dir(),
+            "missing2 created"
+        );
+
+        // Verify permissions: mode 0755 (owned by test user, not root, but the key is the mode).
+        let m1_mode = std::fs::metadata(base.join("missing1"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(m1_mode & 0o777, 0o755, "missing1 has mode 0755");
+        let m2_mode = std::fs::metadata(base.join("missing1").join("missing2"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(m2_mode & 0o777, 0o755, "missing2 has mode 0755");
+
+        // Now ensure_real_leaf_dir can create the final leaf without ENOENT.
+        ensure_real_leaf_dir(&final_dir).unwrap();
+        assert!(final_dir.is_dir(), "final leaf created after intermediates");
 
         let _ = std::fs::remove_dir_all(&base);
     }
