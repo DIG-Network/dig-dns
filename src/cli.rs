@@ -265,6 +265,7 @@ where
 
 /// Load the config from the environment, layering an explicit `--node` flag over it (the
 /// flag has the highest §5.3 precedence). A blank flag is ignored (⇒ use the ladder).
+/// The flag value is validated the same as environment values (SPEC §13.1).
 fn load_config(node_flag: Option<&str>) -> Result<config::Config, String> {
     let mut cfg = config::from_env(|k| std::env::var(k).ok()).map_err(|e| e.to_string())?;
     if let Some(url) = node_flag {
@@ -272,6 +273,8 @@ fn load_config(node_flag: Option<&str>) -> Result<config::Config, String> {
             cfg.node_url = Some(url.trim().to_string());
         }
     }
+    // Re-validate after applying the flag to ensure it meets the same guard (SPEC §13.1).
+    cfg.validate().map_err(|e| e.to_string())?;
     Ok(cfg)
 }
 
@@ -737,5 +740,41 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("loopback"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn load_config_rejects_flag_with_control_characters() {
+        // Regression test for dig_ecosystem #565: the --node flag must validate the same way
+        // the env path does (SPEC §13.1). An embedded newline / control character is rejected
+        // (would otherwise inject a systemd directive into the root unit).
+        // Without the fix, this flag value bypasses is_safe_node_url and reaches the config.
+        let err = load_config(Some("http://x\nExecStartPre=/bin/rm -rf /")).unwrap_err();
+        assert!(
+            err.contains("control character"),
+            "expected control-char rejection; got {err}"
+        );
+    }
+
+    #[test]
+    fn load_config_accepts_flag_without_control_characters() {
+        // The flag path should accept a valid node URL after validation.
+        let cfg = load_config(Some("http://localhost:9778")).unwrap();
+        assert_eq!(cfg.node_url.as_deref(), Some("http://localhost:9778"));
+    }
+
+    #[test]
+    fn load_config_rejects_flag_with_other_control_chars() {
+        // Also test other control characters: tab, carriage return, DEL.
+        for hostile in [
+            "http://x\tx",        // tab
+            "http://x\rDNS=evil", // carriage return
+            "http://x\x7fx",      // DEL
+        ] {
+            let err = load_config(Some(hostile)).unwrap_err();
+            assert!(
+                err.contains("control character"),
+                "expected control-char rejection for {hostile:?}; got {err}"
+            );
+        }
     }
 }

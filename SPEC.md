@@ -619,10 +619,11 @@ interchangeable and idempotent (the clean-reinstall, §13.2, makes a re-run safe
 - **The unit-file write is symlink-safe + atomic (#650).** The Linux backend writes
   `/etc/systemd/system/net.dignetwork.dig-dns.service` via the `O_NOFOLLOW`-temp-then-`rename`
   writer, so a pre-seeded symlink at the unit path can never redirect the root write.
-- **Values baked into the unit are validated at config load.** `DIG_NODE_URL` (and every value
-  written into an `Environment=` line) is rejected if it contains a control character/newline
-  (#565), mirroring the TLD charset guard (#538) — an embedded newline would otherwise inject a
-  raw systemd directive into the root unit.
+- **Values baked into the unit are validated at config load.** The node-endpoint override
+  (`--node` flag, `DIG_NODE_URL` env, or persisted config) is rejected if it contains a control
+  character/newline (#565), mirroring the TLD charset guard (#538) — an embedded newline would
+  otherwise inject a raw systemd directive into the root unit. This guard applies uniformly to ALL
+  paths that set the node URL (flag, env, file config).
 - The **display name** is the human-friendly name shown in the Windows Services console. On
   Windows it is set with `sc config <id> displayname= "DIG NETWORK: DNS"` AFTER create (the
   underlying `sc create` sets the display name to the id). On launchd/systemd the service id is
