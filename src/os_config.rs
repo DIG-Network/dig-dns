@@ -125,6 +125,11 @@ pub fn resolver_file_content(ip: Ipv4Addr) -> String {
     format!("# {MARKER}\nnameserver {ip}\n")
 }
 
+/// The PowerShell cmdlet that flushes the Windows DNS client resolver cache. Run AFTER the NRPT
+/// rule is added so the rule takes effect for names that were negatively cached before install —
+/// this is what makes `.dig` resolution live without a reboot (dig_ecosystem #627).
+pub const CLEAR_DNS_CLIENT_CACHE: &str = "Clear-DnsClientCache";
+
 /// A PowerShell one-liner that adds the `.<tld>` NRPT rule IDEMPOTENTLY (a no-op if a rule for the
 /// namespace already exists — never fighting a pre-existing rule) and tags it with [`MARKER`] via
 /// `-Comment` so [`nrpt_remove_ps_command`] finds + removes only ours.
@@ -342,6 +347,17 @@ pub struct OsConfigReport {
     pub resolver: Option<String>,
     /// Human-facing notes (one line each): what happened + any caveats.
     pub notes: Vec<String>,
+    /// `true` iff, after applying + flushing, an end-to-end resolve VERIFY confirmed the OS now
+    /// routes `*.<tld>` to the responder LIVE (no reboot needed). The expected outcome on all three
+    /// OSes. `false` when no resolver wiring was applied (e.g. the Linux PAC-only path) or the
+    /// verify has not passed yet.
+    pub activated: bool,
+    /// `true` ONLY as a defensive fallback: resolver wiring WAS applied but the post-activate verify
+    /// still failed, so a restart is prompted to pick up the split-DNS. Expected to stay `false`.
+    pub reboot_required: bool,
+    /// Why a reboot is being prompted, when [`Self::reboot_required`]. `None` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reboot_reason: Option<String>,
 }
 
 impl OsConfigReport {
@@ -355,6 +371,9 @@ impl OsConfigReport {
             removed: Vec::new(),
             resolver: None,
             notes: Vec::new(),
+            activated: false,
+            reboot_required: false,
+            reboot_reason: None,
         }
     }
 
@@ -404,6 +423,13 @@ impl OsConfigReport {
         for n in &self.notes {
             out.push_str(&format!("  note:     {n}\n"));
         }
+        if self.activated {
+            out.push_str("  activated: .dig resolution is LIVE now (no reboot required)\n");
+        }
+        if self.reboot_required {
+            let reason = self.reboot_reason.as_deref().unwrap_or("");
+            out.push_str(&format!("  reboot:   RESTART REQUIRED — {reason}\n"));
+        }
         out
     }
 }
@@ -449,6 +475,10 @@ enum Step {
         label: String,
         bucket: Bucket,
     },
+    /// A best-effort PowerShell one-liner (a cache flush / reload) that records nothing — the
+    /// Windows analogue of [`Step::Exec`]. Its failure is non-fatal (mirrors `resolvectl
+    /// flush-caches` / `dscacheutil -flushcache` on the other OSes).
+    PsExec { command: String },
     /// A note only (a caveat / an informational line).
     Note(String),
 }
@@ -511,11 +541,20 @@ fn configure_resolver_steps(os: &str, owner: ResolvOwner, ip: Ipv4Addr, tld: &st
             exec("dscacheutil", &["-flushcache"]),
             exec("killall", &["-HUP", "mDNSResponder"]),
         ],
-        "windows" => vec![Step::Ps {
-            command: nrpt_add_ps_command(ip, tld),
-            label: format!(".{tld} NRPT rule"),
-            bucket: Bucket::Applied,
-        }],
+        // Windows: add the NRPT rule (live for subsequent queries immediately) THEN flush the DNS
+        // client cache. The reboot symptom was purely stale negatively-cached entries — an NRPT
+        // local rule needs no service restart, only the cache cleared (dig_ecosystem #627). We do
+        // NOT restart the `Dnscache` service (it has dependents and the flush is sufficient).
+        "windows" => vec![
+            Step::Ps {
+                command: nrpt_add_ps_command(ip, tld),
+                label: format!(".{tld} NRPT rule"),
+                bucket: Bucket::Applied,
+            },
+            Step::PsExec {
+                command: CLEAR_DNS_CLIENT_CACHE.to_string(),
+            },
+        ],
         _ => Vec::new(),
     }
 }
@@ -551,11 +590,16 @@ fn unconfigure_resolver_steps(os: &str, ip: Ipv4Addr, tld: &str) -> Vec<Step> {
             exec("dscacheutil", &["-flushcache"]),
             exec("killall", &["-HUP", "mDNSResponder"]),
         ],
-        "windows" => vec![Step::Ps {
-            command: nrpt_remove_ps_command(),
-            label: format!(".{tld} NRPT rule"),
-            bucket: Bucket::Removed,
-        }],
+        "windows" => vec![
+            Step::Ps {
+                command: nrpt_remove_ps_command(),
+                label: format!(".{tld} NRPT rule"),
+                bucket: Bucket::Removed,
+            },
+            Step::PsExec {
+                command: CLEAR_DNS_CLIENT_CACHE.to_string(),
+            },
+        ],
         _ => Vec::new(),
     }
 }
@@ -593,6 +637,9 @@ fn execute(
                 Ok(()) => bucket.record(&mut r, label),
                 Err(e) => r.note(format!("{label}: {e}")),
             },
+            Step::PsExec { command } => {
+                let _ = run_ps(&command);
+            }
             Step::Note(msg) => r.note(msg),
         }
     }
@@ -630,11 +677,58 @@ pub fn configure(config: &Config, browser_policy: bool) -> OsConfigReport {
     let resolver = (os == "linux").then(|| owner.label().to_string());
     let steps = configure_resolver_steps(os, owner, ip, &config.tld);
     let mut r = execute("configure-os", ip, resolver, steps);
+    // Whether we actually wired the OS resolver (an NRPT rule / resolver file / drop-in was
+    // applied). On the Linux PAC-only path nothing is applied, so there is nothing to verify and no
+    // reboot to prompt — browsers reach `*.dig` via Path B (the PAC). Capture BEFORE the browser
+    // policy (which also records into `applied`).
+    let wired = !r.applied.is_empty();
     if browser_policy {
         apply_browser_policy(os, ip, &mut r);
     }
+    // Post-configure VERIFY: after applying + flushing, resolve a probe name through the OS
+    // resolver and confirm it now routes to our loopback IP — reusing the doctor OS-routing oracle.
+    let activated = wired && verify_os_routing(config);
+    apply_activation_result(&mut r, os, wired, activated);
     r.ok = true;
     r
+}
+
+/// Record the activation outcome onto the report. PURE (unit-tested): `activated` is set as told;
+/// `reboot_required` is set (with a per-OS reason) ONLY when resolver wiring was applied but the
+/// verify did NOT confirm live resolution — the defensive fallback that prompts a restart.
+fn apply_activation_result(r: &mut OsConfigReport, os: &str, wired: bool, activated: bool) {
+    r.activated = activated;
+    if wired && !activated {
+        r.reboot_required = true;
+        r.reboot_reason = Some(reboot_reason(os));
+    }
+}
+
+/// The per-OS restart-prompt reason, used only when the post-activate verify fails. PURE.
+fn reboot_reason(os: &str) -> String {
+    let how = match os {
+        "windows" => "the NRPT split-DNS rule",
+        "macos" => "the /etc/resolver split-DNS config",
+        "linux" => "the systemd-resolved/NetworkManager split-DNS config",
+        _ => "the split-DNS config",
+    };
+    format!(
+        "restart to activate .dig name resolution — the OS resolver has not yet picked up {how}"
+    )
+}
+
+/// Resolve a probe `.<tld>` name through the OS resolver and evaluate it against the doctor
+/// OS-routing oracle. `true` iff the OS now routes `*.<tld>` to our loopback IP LIVE. OS glue
+/// (a real `getaddrinfo`), mirroring [`execute`]; the oracle it defers to is pure + unit-tested.
+fn verify_os_routing(config: &Config) -> bool {
+    use std::net::ToSocketAddrs;
+    let host = format!("configure-probe.{}:0", config.tld);
+    let resolved: Vec<std::net::IpAddr> = host
+        .to_socket_addrs()
+        .map(|it| it.map(|s| s.ip()).collect())
+        .unwrap_or_default();
+    crate::doctor::evaluate_os_routing(config.loopback_ip, &resolved).status
+        == crate::doctor::CheckStatus::Pass
 }
 
 /// Reverse [`configure`]: remove the `*.<tld>` resolver wiring this tool OR the legacy installer
@@ -689,7 +783,7 @@ pub fn is_configured(config: &Config) -> Option<bool> {
 fn is_elevated() -> bool {
     #[cfg(windows)]
     {
-        Command::new("net")
+        Command::new(resolve_system_tool("net"))
             .arg("session")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -699,7 +793,7 @@ fn is_elevated() -> bool {
     }
     #[cfg(not(windows))]
     {
-        Command::new("id")
+        Command::new(resolve_system_tool("id"))
             .arg("-u")
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
@@ -753,9 +847,13 @@ fn remove_if_ours(path: &Path, our_ip: Ipv4Addr) -> Result<bool, String> {
     }
 }
 
-/// Run `cmd args…`, discarding output. `Ok(())` iff it exits 0.
+/// Run `cmd args…` by its ABSOLUTE path, discarding output. `Ok(())` iff it exits 0.
+///
+/// The bare tool name is resolved to a trusted absolute path ([`resolve_system_tool`]) BEFORE
+/// spawning — this whole module runs elevated, so a bare-name lookup would let a `PATH`-planted
+/// binary hijack the privileged process (dig_ecosystem #565/#657).
 fn run(cmd: &str, args: &[&str]) -> Result<(), String> {
-    let status = Command::new(cmd)
+    let status = Command::new(resolve_system_tool(cmd))
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -768,9 +866,10 @@ fn run(cmd: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
-/// Run a PowerShell command line, discarding stdout. `Ok(())` iff PowerShell exits 0.
+/// Run a PowerShell command line by PowerShell's ABSOLUTE path, discarding stdout. `Ok(())` iff
+/// PowerShell exits 0. Absolute-pathed for the same anti-hijack reason as [`run`].
 fn run_ps(command: &str) -> Result<(), String> {
-    let status = Command::new("powershell")
+    let status = Command::new(resolve_system_tool("powershell"))
         .args(["-NoProfile", "-NonInteractive", "-Command", command])
         .status()
         .map_err(|e| format!("spawn powershell: {e}"))?;
@@ -779,6 +878,51 @@ fn run_ps(command: &str) -> Result<(), String> {
     } else {
         Err("powershell exited non-zero".to_string())
     }
+}
+
+/// Resolve a known system tool's bare name to a trusted ABSOLUTE path, so an elevated spawn can
+/// never be hijacked by a `PATH`-planted binary (dig_ecosystem #565/#657). The result is ALWAYS
+/// absolute — an unknown name or a not-found tool falls back to the first canonical candidate
+/// (still absolute), never the bare name.
+///
+/// - Windows: built under `%SystemRoot%\System32` (PowerShell under its `WindowsPowerShell\v1.0`).
+/// - Unix: the first existing candidate across the canonical `/usr/bin`, `/bin`, `/usr/sbin`,
+///   `/sbin` locations, else the first candidate.
+fn resolve_system_tool(name: &str) -> String {
+    #[cfg(windows)]
+    {
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let system32 = format!(r"{system_root}\System32");
+        match name {
+            "powershell" => format!(r"{system32}\WindowsPowerShell\v1.0\powershell.exe"),
+            "net" => format!(r"{system32}\net.exe"),
+            "reg" => format!(r"{system32}\reg.exe"),
+            other => format!(r"{system32}\{other}.exe"),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let candidates = system_tool_candidates(name);
+        candidates
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .cloned()
+            .unwrap_or_else(|| candidates[0].clone())
+    }
+}
+
+/// The canonical absolute-path candidates for a Unix system tool, most-preferred first. Every
+/// candidate is absolute, so the [`resolve_system_tool`] fallback stays absolute. PURE.
+#[cfg(not(windows))]
+fn system_tool_candidates(name: &str) -> Vec<String> {
+    let dirs: &[&str] = match name {
+        // networking tools live in the sbin dirs on macOS/BSD
+        "ifconfig" => &["/sbin", "/usr/sbin"],
+        // launchctl is macOS-only, in /bin
+        "launchctl" => &["/bin", "/usr/bin"],
+        _ => &["/usr/bin", "/bin", "/usr/sbin", "/sbin"],
+    };
+    dirs.iter().map(|d| format!("{d}/{name}")).collect()
 }
 
 /// Run `reg <args…>`, discarding output. `Ok(())` iff it exits 0.
@@ -1338,13 +1482,120 @@ mod tests {
     }
 
     #[test]
-    fn windows_plan_is_the_nrpt_add_recorded_as_applied() {
+    fn windows_plan_is_the_nrpt_add_then_a_cache_flush() {
         let steps = configure_resolver_steps("windows", ResolvOwner::Unknown, IP, "dig");
-        assert_eq!(steps.len(), 1);
+        // The NRPT add (recorded as applied) FOLLOWED BY the DNS-cache flush that makes it live
+        // without a reboot (dig_ecosystem #627).
+        assert_eq!(steps.len(), 2);
         assert!(matches!(&steps[0], Step::Ps { command, label, bucket }
             if command.contains("Add-DnsClientNrptRule")
                 && label == ".dig NRPT rule"
                 && *bucket == Bucket::Applied));
+        assert!(matches!(&steps[1], Step::PsExec { command }
+            if command == CLEAR_DNS_CLIENT_CACHE));
+    }
+
+    #[test]
+    fn windows_unconfigure_flushes_the_cache_after_removing_the_rule() {
+        let win = unconfigure_resolver_steps("windows", IP, "dig");
+        assert!(win
+            .iter()
+            .any(|s| matches!(s, Step::PsExec { command } if command == CLEAR_DNS_CLIENT_CACHE)));
+    }
+
+    #[test]
+    fn reboot_is_required_only_when_wired_but_verify_failed() {
+        // Applied resolver wiring + verify PASSED -> live, no reboot.
+        let mut live = OsConfigReport::started("configure-os");
+        apply_activation_result(&mut live, "windows", true, true);
+        assert!(live.activated);
+        assert!(!live.reboot_required);
+        assert!(live.reboot_reason.is_none());
+
+        // Applied wiring + verify FAILED -> defensive reboot prompt with a per-OS reason.
+        let mut stale = OsConfigReport::started("configure-os");
+        apply_activation_result(&mut stale, "windows", true, false);
+        assert!(!stale.activated);
+        assert!(stale.reboot_required);
+        assert!(stale.reboot_reason.unwrap().contains("NRPT"));
+
+        // Nothing wired (Linux PAC-only path) -> not activated, but NO reboot prompt.
+        let mut pac = OsConfigReport::started("configure-os");
+        apply_activation_result(&mut pac, "linux", false, false);
+        assert!(!pac.activated);
+        assert!(!pac.reboot_required);
+        assert!(pac.reboot_reason.is_none());
+    }
+
+    #[test]
+    fn reboot_reason_names_the_per_os_mechanism() {
+        assert!(reboot_reason("windows").contains("NRPT"));
+        assert!(reboot_reason("macos").contains("/etc/resolver"));
+        assert!(reboot_reason("linux").contains("systemd-resolved"));
+        assert!(reboot_reason("freebsd").contains("split-DNS"));
+    }
+
+    #[test]
+    fn summary_surfaces_the_activation_and_reboot_lines() {
+        let mut live = OsConfigReport::started("configure-os");
+        live.ok = true;
+        live.activated = true;
+        assert!(live.summary().contains("LIVE now"));
+
+        let mut stale = OsConfigReport::started("configure-os");
+        stale.ok = true;
+        stale.reboot_required = true;
+        stale.reboot_reason = Some("restart to activate .dig".to_string());
+        assert!(stale.summary().contains("RESTART REQUIRED"));
+    }
+
+    #[test]
+    fn report_json_carries_the_stable_activation_fields() {
+        let mut r = OsConfigReport::started("configure-os");
+        r.activated = true;
+        let json = r.to_json();
+        assert!(json.contains("\"activated\":true"));
+        assert!(json.contains("\"reboot_required\":false"));
+        // reboot_reason is omitted when None (skip_serializing_if).
+        assert!(!json.contains("reboot_reason"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolve_system_tool_returns_absolute_paths_never_bare_names() {
+        for tool in [
+            "systemctl",
+            "resolvectl",
+            "ifconfig",
+            "dscacheutil",
+            "killall",
+            "id",
+        ] {
+            let resolved = resolve_system_tool(tool);
+            assert!(
+                resolved.starts_with('/'),
+                "{tool} resolved to a non-absolute path: {resolved}"
+            );
+            assert!(resolved.ends_with(tool));
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn ifconfig_prefers_the_sbin_locations() {
+        let candidates = system_tool_candidates("ifconfig");
+        assert_eq!(candidates[0], "/sbin/ifconfig");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_system_tool_builds_absolute_system32_paths() {
+        let ps = resolve_system_tool("powershell");
+        assert!(ps.contains(r"\System32\WindowsPowerShell\v1.0\powershell.exe"));
+        // Backed by %SystemRoot% (or the C:\Windows fallback) — always an absolute drive path.
+        assert!(ps.contains(":\\"));
+        assert!(resolve_system_tool("net").ends_with(r"\System32\net.exe"));
+        assert!(resolve_system_tool("reg").ends_with(r"\System32\reg.exe"));
     }
 
     #[test]

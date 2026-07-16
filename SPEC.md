@@ -774,9 +774,22 @@ own duplicated per-OS logic.
 | Linux (systemd-resolved) | `/etc/systemd/resolved.conf.d/dig.conf` | `[Resolve]` `DNS=<ip>` `Domains=~<tld>`, then `systemctl reload-or-restart systemd-resolved` + `resolvectl flush-caches` |
 | Linux (NetworkManager-dnsmasq) | `/etc/NetworkManager/dnsmasq.d/dig.conf` | `server=/<tld>/<ip>`, then `systemctl reload NetworkManager` |
 | macOS | boot-persistent `lo0` alias LaunchDaemon `/Library/LaunchDaemons/net.dignetwork.dig-dns-lo0.plist` + live `ifconfig lo0 alias <ip> up` + `/etc/resolver/<tld>` (`nameserver <ip>`) + `dscacheutil -flushcache` & `killall -HUP mDNSResponder` | — |
-| Windows | NRPT rule `Add-DnsClientNrptRule -Namespace .<tld> -NameServers <ip>` | — |
+| Windows | NRPT rule `Add-DnsClientNrptRule -Namespace .<tld> -NameServers <ip>`, then `Clear-DnsClientCache` | — |
 
 The default `<ip>`/`<tld>` are `127.0.0.5` / `dig` (§7); both follow the resolved config.
+
+**Every OS flushes its resolver cache as the last wiring step** so resolution goes LIVE with no
+reboot (§15.6): Linux `resolvectl flush-caches`, macOS `dscacheutil -flushcache` +
+`killall -HUP mDNSResponder`, Windows `Clear-DnsClientCache`. A Windows NRPT *local* rule is
+effective for subsequent queries immediately — the historical "needs a reboot" symptom was purely
+the stale (often negatively-cached) resolver cache, cleared by the flush. `configure-os` does NOT
+restart the Windows `Dnscache` service (it has dependents and the flush is sufficient).
+
+**Elevated spawns are absolute-pathed.** Because `configure-os`/`unconfigure-os` run elevated, every
+external tool (`powershell`, `net`, `reg`, `systemctl`, `resolvectl`, `ifconfig`, `launchctl`,
+`dscacheutil`, `killall`, `id`) is invoked by a trusted ABSOLUTE path — Windows under
+`%SystemRoot%\System32`, Unix from the canonical `/usr/bin`·`/bin`·`/usr/sbin`·`/sbin` locations —
+never a bare name resolved via `PATH` (anti-hijack, dig_ecosystem #565/#657).
 
 - **Linux resolver detection.** The owning resolver is DETECTED, never assumed: systemd-resolved
   when `/etc/resolv.conf` symlinks into `systemd`, else NetworkManager-dnsmasq when its drop-in
@@ -820,7 +833,30 @@ resolve there via Path A. Such a browser still needs EITHER Path B (point its pr
 - **Package opt-out.** `.deb`: env `DIG_DNS_SKIP_CONFIGURE_OS=1`. `.msi`: public property
   `CONFIGURE_OS=0`. `.pkg`: unconditional (no prompt), reversible via the shipped `uninstall.sh`.
 
-### 15.5 `doctor` awareness
+### 15.5 Live activation + post-configure verify + reboot fallback
+
+After applying the resolver wiring (and flushing the cache, §15.1), `configure-os` VERIFIES that the
+OS now routes `*.<tld>` LIVE: it resolves a probe name (`configure-probe.<tld>`) through the OS
+resolver and evaluates it with the same oracle `doctor`'s Path-A `os_routing` check uses — the probe
+must return the responder's loopback IP. On all three OSes this is expected to PASS with no reboot.
+
+The outcome is reported in `OsConfigReport` (the `--json` machine contract, §6.2 / §10) via three
+STABLE fields:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `activated` | bool | `true` iff the post-configure verify confirmed the OS routes `*.<tld>` to the responder LIVE (no reboot). `false` when no resolver wiring was applied (the Linux PAC-only path) or the verify did not pass. |
+| `reboot_required` | bool | `true` ONLY as a defensive fallback: resolver wiring WAS applied but the verify still failed. Expected to stay `false`. |
+| `reboot_reason` | string? | Present iff `reboot_required`; a per-OS explanation of what the restart will pick up. Omitted otherwise. |
+
+`reboot_required` is set IFF wiring was applied AND the verify failed — so the Linux PAC-only path
+(nothing applied) never prompts a reboot, and a successful activation never does. A consumer (the
+`dig-installer`, §14 / dig_ecosystem #627 WU2) surfaces a restart prompt ONLY when `reboot_required`
+is `true`. This is NOT a whole-machine reboot claim: a browser with its own DoH/HTTP cache may still
+need a browser restart (§15.3) — a distinct, browser-scoped caveat, never surfaced as "restart your
+computer".
+
+### 15.6 `doctor` awareness
 
 `doctor` (§9) reports an informational `os_config` check — whether the `configure-os` (or legacy)
 resolver wiring is present on this machine — so a "configured but a DoH browser bypasses it" state
