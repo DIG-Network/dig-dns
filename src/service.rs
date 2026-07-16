@@ -528,7 +528,10 @@ fn linux_unit_contents(plan: &InstallPlan) -> String {
          StateDirectory=dig-dns\n\
          NoNewPrivileges=true\n\
          ProtectSystem=full\n\
-         ProtectHome=true\n\
+         # read-only (NOT true): the CLI-installed binary may live under a home dir (e.g.\n\
+         # ~/.dig/bin, #528), which ProtectHome=true would hide from the service, breaking\n\
+         # ExecStart; read-only still lets it READ+EXEC the binary while blocking writes to home.\n\
+         ProtectHome=read-only\n\
          PrivateTmp=true\n\
          {env_lines}\
          {wanted_by}"
@@ -987,6 +990,10 @@ mod tests {
         assert!(unit.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE"));
         assert!(unit.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE"));
         assert!(unit.contains("NoNewPrivileges=true"));
+        // ProtectHome MUST be read-only, not true: the binary may live under a home dir (#528),
+        // which ProtectHome=true would hide from the service and break ExecStart.
+        assert!(unit.contains("ProtectHome=read-only"));
+        assert!(!unit.contains("ProtectHome=true"));
         // Runs as root: it must NOT drop to a dedicated account that can't traverse the home dir.
         assert!(!unit.contains("User="));
         assert!(!unit.contains("DynamicUser="));

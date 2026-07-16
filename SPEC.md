@@ -604,9 +604,11 @@ interchangeable and idempotent (the clean-reinstall, §13.2, makes a re-run safe
   unit cannot; `dig-dns install`/`uninstall` therefore require root (re-run with `sudo`) on Linux,
   matching the `.deb`. The service runs as root with a bounded capability set —
   `AmbientCapabilities`/`CapabilityBoundingSet=CAP_NET_BIND_SERVICE`, `NoNewPrivileges`,
-  `ProtectSystem=full`, `ProtectHome`, `PrivateTmp` — and NO dedicated `User=`/`DynamicUser=`, so
-  its `ExecStart` can reach the binary in ANY install dir (including a `0750` home like `~/.dig/bin`)
-  without the `203/EXEC` traversal failure a restricted service account hits (#528). macOS remains a
+  `ProtectSystem=full`, `ProtectHome=read-only`, `PrivateTmp` — and NO dedicated
+  `User=`/`DynamicUser=`, so its `ExecStart` can reach the binary in ANY install dir (including a
+  home dir like `~/.dig/bin`) without the `203/EXEC` traversal failure a restricted service account
+  hits (#528). `ProtectHome` is `read-only` rather than `true` precisely so a binary under a home
+  dir stays readable+executable to the service while home writes remain blocked. macOS remains a
   user-domain launchd agent (no elevation required); Windows remains system-scope SCM (elevation
   required).
 - The **display name** is the human-friendly name shown in the Windows Services console. On
