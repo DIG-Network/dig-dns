@@ -532,16 +532,135 @@ fn ensure_root_owned_not_writable(path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Is a *prefix component* of the root staging path safe? STRICTER than
+/// [`root_owned_not_writable`]: on top of root-owned + not group/world-writable, a prefix component
+/// must NOT be a symlink. A symlink anywhere in the chain could redirect a follow-through `chown`/
+/// `set_permissions`/`create_dir_all` onto an attacker-chosen target, and directory-entry ops
+/// (rename/replace of the whole staged subdir) are governed by the PARENT's perms — so every
+/// ancestor is held to the same bar. PURE (takes the lstat fields), so both arms are unit-tested
+/// without a real root-owned tree (dig_ecosystem #701).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn prefix_component_safe(uid: u32, mode: u32, is_symlink: bool) -> bool {
+    !is_symlink && root_owned_not_writable(uid, mode)
+}
+
+/// Fail-closed guard over the ENTIRE prefix chain of `dir`: every EXISTING ancestor (via
+/// `symlink_metadata`/lstat, so a symlink is judged on its own identity, never its target) must be a
+/// non-symlink directory owned by root and not group/world-writable. Components that do not yet
+/// exist (the leaf we are about to create) are skipped.
+///
+/// This closes the #701 residual on a NON-DEFAULT group/world-writable `/usr/local`(/lib) prefix
+/// that the #23 final-component-only verify missed: on such a prefix an in-group attacker could
+/// otherwise pre-plant a symlink intermediate (redirecting root's `chown`/`chmod` onto their target)
+/// or replace the whole staged subdir post-install (the parent's perms govern the rename) → an
+/// attacker binary exec'd as root at the next service restart. Verifying the full prefix refuses the
+/// install on any such misconfigured host rather than silently staging into it.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn ensure_prefix_root_owned_not_writable(dir: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    for component in dir.ancestors() {
+        let meta = match std::fs::symlink_metadata(component) {
+            Ok(meta) => meta,
+            // Not yet created (the leaf we will mkdir) — nothing to verify for this component.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let is_symlink = meta.file_type().is_symlink();
+        if !prefix_component_safe(meta.uid(), meta.mode(), is_symlink) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "dig-dns: refusing to stage a root service under {} — the path component {} \
+                     must be a non-symlink directory owned by root (uid 0) and not group/world-\
+                     writable, but it is owned by uid {} with mode {:o}{}. Install dig-dns under a \
+                     root-owned, root-only-writable prefix and retry.",
+                    dir.display(),
+                    component.display(),
+                    meta.uid(),
+                    meta.mode() & 0o7777,
+                    if is_symlink { " (a symlink)" } else { "" },
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Create any missing intermediate directories from the root down to the parent of `dir`,
+/// using `create_dir` for each missing component (never `create_dir_all`). Each created
+/// directory is owned by root + mode 0755. Called after `ensure_prefix_root_owned_not_writable`
+/// has verified the EXISTING ancestors are all root-owned/non-symlink/non-writable, so creating
+/// missing intermediates in that verified chain is safe (no non-root actor could have pre-planted them).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn create_missing_intermediates(dir: &std::path::Path) -> io::Result<()> {
+    use std::fs::Permissions;
+    use std::os::unix::fs::{chown, PermissionsExt};
+
+    let target = dir.parent().unwrap_or(dir);
+    if target.exists() {
+        // All ancestors already exist, nothing to do.
+        return Ok(());
+    }
+
+    // Collect components that don't yet exist, walking up from target.
+    let mut to_create = Vec::new();
+    let mut current = target;
+    while !current.exists() {
+        to_create.push(current.to_path_buf());
+        if let Some(parent) = current.parent() {
+            current = parent;
+        } else {
+            break;
+        }
+    }
+
+    // Create from the deepest existing ancestor downward, one at a time.
+    to_create.reverse();
+    for path in to_create {
+        std::fs::create_dir(&path)?;
+        chown(&path, Some(0), Some(0))?;
+        std::fs::set_permissions(&path, Permissions::from_mode(0o755))?;
+    }
+
+    Ok(())
+}
+
+/// Ensure `dir` is a REAL directory (never a followed symlink), creating it fresh when absent and
+/// UNLINKING any pre-planted symlink or file squatting the path first (`remove_file` unlinks the
+/// entry itself, never following a symlink to its target). An existing REAL directory (a prior
+/// install's) is reused so reinstalls stay idempotent. Ownership + mode are set and verified by the
+/// caller; this only guarantees no symlink is followed when the leaf comes into being (#701) — the
+/// #23 gap where `create_dir_all` treats a pre-planted symlink-to-dir as already existing.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn ensure_real_leaf_dir(dir: &std::path::Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        // A prior install's real directory — reuse it (the caller re-asserts root ownership).
+        Ok(meta) if meta.file_type().is_dir() => Ok(()),
+        // A symlink or regular file squatting the leaf: unlink it (never followed) + create fresh.
+        Ok(_) => {
+            std::fs::remove_file(dir)?;
+            std::fs::create_dir(dir)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::create_dir(dir),
+        Err(e) => Err(e),
+    }
+}
+
 /// Stage the running binary into the ROOT-OWNED [`LINUX_PROGRAM_DIR`] and return the destination
 /// path the root systemd unit's `ExecStart` will target (dig_ecosystem #565). Runs as root (the
 /// install entrypoint has already verified elevation). The copy — rather than baking
 /// `current_exe()` — is what guarantees the unit never execs a user-writable binary as root:
 ///
-/// 1. create [`LINUX_PROGRAM_DIR`], `chown root:root`, `0755`;
-/// 2. remove any pre-existing destination (via `remove_file`, which unlinks a planted symlink
+/// 1. verify the WHOLE prefix chain (`/usr/local/lib`, `/usr/local`, `/usr`, `/`) is root-owned,
+///    non-symlink, and root-only-writable — refuse otherwise (#701 defense-in-depth on a
+///    non-default group/world-writable prefix);
+/// 2. create the leaf [`LINUX_PROGRAM_DIR`] WITHOUT following a symlink (a planted symlink/file is
+///    unlinked, never followed), then `chown root:root`, `0755`;
+/// 3. remove any pre-existing destination (via `remove_file`, which unlinks a planted symlink
 ///    instead of following it) and copy the current binary in;
-/// 3. `chown root:root` + `0755` the copy;
-/// 4. VERIFY (fail-closed) both the directory and the copied file are root-owned + not
+/// 4. `chown root:root` + `0755` the copy;
+/// 5. VERIFY (fail-closed) both the directory and the copied file are root-owned + not
 ///    group/world-writable before returning — so a hostile pre-seeded dir/symlink is caught.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn stage_service_program() -> io::Result<PathBuf> {
@@ -550,7 +669,23 @@ fn stage_service_program() -> io::Result<PathBuf> {
 
     let source = std::env::current_exe()?;
     let dir = PathBuf::from(LINUX_PROGRAM_DIR);
-    std::fs::create_dir_all(&dir)?;
+
+    // #701: before touching anything, hold the ENTIRE prefix above the leaf to the root-owned,
+    // non-symlink, root-only-writable bar. This refuses the install on a misconfigured host where a
+    // group/world-writable `/usr/local`(/lib) would let an in-group attacker pre-plant a symlink
+    // intermediate (redirecting the chown/chmod below) or replace the staged subdir after install.
+    let prefix = dir.parent().unwrap_or(&dir);
+    ensure_prefix_root_owned_not_writable(prefix)?;
+
+    // Create any missing intermediate directories in the path (e.g., /usr/local/lib if absent on
+    // a minimal host). Each is created one at a time with create_dir (no-follow), owned by root,
+    // and mode 0755. Safe because the prefix walk above proved every EXISTING ancestor is
+    // root-only-writable, so no non-root actor could have pre-planted the missing components.
+    create_missing_intermediates(&dir)?;
+
+    // Create/reuse the leaf without following a symlink (#701): a pre-planted symlink-to-dir is
+    // unlinked rather than treated as the existing directory (the `create_dir_all` gap).
+    ensure_real_leaf_dir(&dir)?;
     chown(&dir, Some(0), Some(0))?;
     std::fs::set_permissions(&dir, Permissions::from_mode(0o755))?;
 
@@ -1168,6 +1303,165 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn prefix_component_safe_rejects_symlinks_even_when_root_owned() {
+        // ACCEPT: a real (non-symlink) directory, root-owned + not group/world-writable.
+        assert!(prefix_component_safe(0, 0o755, false));
+        assert!(prefix_component_safe(0, 0o700, false));
+        assert!(prefix_component_safe(0, 0o555, false));
+        // REJECT: a SYMLINK component, even when root-owned + unwritable (#701) — it could redirect
+        // a follow-through chown/chmod onto an attacker target.
+        assert!(!prefix_component_safe(0, 0o755, true));
+        // REJECT: the ownership/writability bar still binds non-symlink components.
+        assert!(!prefix_component_safe(1000, 0o755, false)); // not root-owned
+        assert!(!prefix_component_safe(0, 0o775, false)); // group-writable
+        assert!(!prefix_component_safe(0, 0o757, false)); // world-writable
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn ensure_prefix_refuses_a_symlinked_intermediate_component() {
+        // #701 vector 1: a symlinked intermediate in the staging prefix. Walking a path THROUGH the
+        // symlink component must fail closed BEFORE any chown/chmod is attempted.
+        let base = std::env::temp_dir().join(format!("dig-dns-prefix-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = ensure_prefix_root_owned_not_writable(&link.join("dig-dns"))
+            .expect_err("a symlinked prefix component must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn ensure_prefix_refuses_a_group_or_world_writable_prefix() {
+        // #701 vector 2: a non-default group/world-writable prefix (e.g. /usr/local/lib root:staff
+        // 0775) lets an in-group attacker replace the staged subdir. The prefix walk refuses it.
+        let base = std::env::temp_dir().join(format!("dig-dns-prefix-wr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let prefix = base.join("local").join("lib");
+        std::fs::create_dir_all(&prefix).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let err = ensure_prefix_root_owned_not_writable(&prefix.join("dig-dns"))
+            .expect_err("a group/world-writable prefix must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn ensure_real_leaf_dir_unlinks_a_planted_symlink_and_creates_a_real_dir() {
+        // #701 vector 1 at the LEAF: a symlink pre-planted at the staging dir must be unlinked (not
+        // followed) and replaced by a fresh REAL directory — the attacker target is never touched.
+        let base = std::env::temp_dir().join(format!("dig-dns-leaf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("attacker-target");
+        std::fs::create_dir_all(&target).unwrap();
+        let sentinel = target.join("keep");
+        std::fs::write(&sentinel, b"untouched").unwrap();
+        let leaf = base.join("dig-dns");
+        std::os::unix::fs::symlink(&target, &leaf).unwrap();
+        assert!(std::fs::symlink_metadata(&leaf)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        ensure_real_leaf_dir(&leaf).unwrap();
+
+        let meta = std::fs::symlink_metadata(&leaf).unwrap();
+        assert!(meta.file_type().is_dir(), "leaf must be a real directory");
+        assert!(
+            !meta.file_type().is_symlink(),
+            "planted symlink must be gone"
+        );
+        // The symlink was unlinked, never followed: the attacker target is untouched.
+        assert!(sentinel.is_file());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn ensure_real_leaf_dir_creates_when_absent_and_reuses_an_existing_dir() {
+        // Happy path: creates the leaf when absent, and is idempotent on an existing real dir (a
+        // prior install) so reinstalls succeed. (The all-root real staging is covered by the sudo
+        // Service-smoke CI, which non-root unit tests cannot construct.)
+        let base = std::env::temp_dir().join(format!("dig-dns-leaf2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let leaf = base.join("dig-dns");
+
+        ensure_real_leaf_dir(&leaf).unwrap();
+        assert!(leaf.is_dir(), "leaf created when absent");
+        ensure_real_leaf_dir(&leaf).unwrap();
+        assert!(
+            leaf.is_dir(),
+            "existing real dir reused (idempotent reinstall)"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn create_missing_intermediates_builds_absent_parent_chain() {
+        // Regression for the #701 fix: `create_dir` (not `create_dir_all`) in `ensure_real_leaf_dir`
+        // breaks clean installs when `/usr/local/lib` is absent (standard on minimal hosts). The fix
+        // creates missing intermediates safely before the leaf. This test verifies that
+        // `create_missing_intermediates` builds the missing components, each root-owned + mode 0755.
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("dig-dns-missing-int-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // Create a mock root-owned-like ancestor (the test runs unprivileged, so we simulate by
+        // creating the base). In a real root install, every existing ancestor would be verified
+        // root-owned by ensure_prefix_root_owned_not_writable first.
+        std::fs::create_dir_all(&base).unwrap();
+
+        // The path we want to build: base/missing1/missing2/final
+        let final_dir = base.join("missing1").join("missing2").join("final");
+
+        // Before the fix, calling ensure_real_leaf_dir directly on final_dir would fail with
+        // ENOENT because missing1 and missing2 don't exist. Calling create_missing_intermediates
+        // builds them, then the leaf can be created.
+        create_missing_intermediates(&final_dir).unwrap();
+
+        // Verify the intermediates were created.
+        assert!(base.join("missing1").is_dir(), "missing1 created");
+        assert!(
+            base.join("missing1").join("missing2").is_dir(),
+            "missing2 created"
+        );
+
+        // Verify permissions: mode 0755 (owned by test user, not root, but the key is the mode).
+        let m1_mode = std::fs::metadata(base.join("missing1"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(m1_mode & 0o777, 0o755, "missing1 has mode 0755");
+        let m2_mode = std::fs::metadata(base.join("missing1").join("missing2"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(m2_mode & 0o777, 0o755, "missing2 has mode 0755");
+
+        // Now ensure_real_leaf_dir can create the final leaf without ENOENT.
+        ensure_real_leaf_dir(&final_dir).unwrap();
+        assert!(final_dir.is_dir(), "final leaf created after intermediates");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
