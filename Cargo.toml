@@ -10,7 +10,7 @@
 # so it MUST live at the root and increase on every PR (CLAUDE.md §2.4 / §3.6).
 [package]
 name = "dig-dns"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 description = "Local *.dig name resolution: a DNS responder + HTTP gateway resolving <storeId>.dig to DIG store content via a dig-node."
 license = "GPL-2.0-only"
@@ -162,8 +162,17 @@ hickory-resolver = { version = "0.26.1", default-features = false, features = [
 # executable the SCM launches must itself speak the service protocol (StartServiceCtrlDispatcher)
 # or the SCM kills it with error 1053. `src/win_service.rs` (the `run-service` entrypoint) is
 # that dispatcher. Windows-only, so it never enters the non-Windows build/coverage.
+[target.'cfg(unix)'.dependencies]
+# `O_NOFOLLOW` for the symlink-safe atomic `/etc` policy writer (src/os_config.rs atomic_write,
+# #650). Unix-only; the value differs per platform so the constant comes from libc, not a literal.
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
+# `GetSystemDirectoryW` for the trusted system-tool resolver (src/system_tool.rs, #657): the real
+# System32 path from the syscall, immune to a poisoned %SystemRoot% — the anti-search-order-hijack
+# base for every elevated bare-name spawn (sc/net/powershell/reg).
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 # `assert_cmd` + `predicates` drive the REAL built binaries (`dig-dns` AND the `digd` alias)

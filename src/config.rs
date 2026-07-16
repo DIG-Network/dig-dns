@@ -112,6 +112,13 @@ pub enum ConfigError {
     /// The TLD normalised to an empty string.
     #[error("TLD must not be empty")]
     EmptyTld,
+    /// The TLD contained a character outside the safe `[a-z0-9-]` charset. Rejected as
+    /// defense-in-depth (dig_ecosystem #538): the tld flows UNESCAPED into elevated builders —
+    /// the NRPT PowerShell single-quoted arg, the macOS resolver PATH, and systemd/NM drop-in
+    /// bodies — so a `'`, `/`, `..`, or newline would be a latent root/LocalSystem injection sink
+    /// the moment a future config source is not env-only. A DNS label is `[a-z0-9-]` anyway.
+    #[error("TLD '{0}' must contain only lowercase letters, digits, and hyphens ([a-z0-9-])")]
+    InvalidTldCharset(String),
     /// [`ENV_SECURE_UPSTREAM`] was set to neither `on` nor `off`.
     #[error("DIG_DNS_SECURE_UPSTREAM: '{0}' is not 'on' or 'off'")]
     InvalidToggle(String),
@@ -159,16 +166,35 @@ impl Config {
         if self.tld.is_empty() {
             return Err(ConfigError::EmptyTld);
         }
+        if !is_safe_tld(&self.tld) {
+            return Err(ConfigError::InvalidTldCharset(self.tld.clone()));
+        }
         Ok(())
     }
 }
 
 /// Normalise a TLD: trim whitespace, strip a single leading `.`, lowercase.
+///
+/// Normalisation is lexical only — it does NOT reject an out-of-charset tld. The charset guard
+/// ([`is_safe_tld`], enforced in [`Config::validate`]) is the security boundary; keeping the two
+/// separate lets callers normalise freely while every load path still validates before use.
 pub fn normalize_tld(raw: &str) -> String {
     raw.trim()
         .strip_prefix('.')
         .unwrap_or_else(|| raw.trim())
         .to_ascii_lowercase()
+}
+
+/// Is `tld` confined to the safe `[a-z0-9-]` charset? This is the defense-in-depth guard
+/// (dig_ecosystem #538) that keeps a metacharacter (`'`, `/`, `..`, a newline, `;`, `&`) out of
+/// the tld before it reaches any elevated builder (NRPT PowerShell, the macOS resolver PATH, a
+/// systemd/NetworkManager drop-in body). A real DNS label is `[a-z0-9-]` regardless, so this
+/// rejects nothing legitimate. Assumes `tld` is already lowercased by [`normalize_tld`].
+pub fn is_safe_tld(tld: &str) -> bool {
+    !tld.is_empty()
+        && tld
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Resolve the dig-node endpoint override by precedence: CLI flag > env > file config.
@@ -397,6 +423,16 @@ mod tests {
     }
 
     #[test]
+    fn from_env_rejects_a_hostile_tld_via_the_charset_guard() {
+        // The env load path MUST run the charset guard (dig_ecosystem #538) — a metacharacter tld
+        // set via DIG_DNS_TLD is refused at load, never reaching a builder.
+        assert!(matches!(
+            from_env(env_of(&[(ENV_TLD, "dig'; reboot")])).unwrap_err(),
+            ConfigError::InvalidTldCharset(_)
+        ));
+    }
+
+    #[test]
     fn normalize_tld_strips_dot_and_lowercases() {
         assert_eq!(normalize_tld(".DIG"), "dig");
         assert_eq!(normalize_tld("  Dig  "), "dig");
@@ -432,5 +468,53 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(c.validate(), Err(ConfigError::EmptyTld));
+    }
+
+    #[test]
+    fn validate_rejects_tld_with_injection_metacharacters() {
+        // dig_ecosystem #538: a tld carrying a metacharacter must be refused BEFORE it can reach
+        // an elevated builder. Each of these would arm a distinct injection sink if it flowed
+        // through unescaped — a PowerShell single-quote break, a resolver-PATH traversal, a
+        // systemd drop-in newline, a shell separator.
+        for hostile in [
+            "dig'; rm -rf /",   // PowerShell single-quoted-arg break (NRPT → LocalSystem)
+            "../etc/passwd",    // macOS resolver PATH traversal (arbitrary root file write)
+            "dig\nDNS=1.1.1.1", // systemd/NM drop-in body newline injection
+            "dig;reboot",       // shell separator
+            "dig space",        // whitespace is not a DNS label char
+            "DIG",              // uppercase never survives normalize_tld; refused if forced in
+        ] {
+            let c = Config {
+                tld: hostile.to_string(),
+                ..Config::default()
+            };
+            assert_eq!(
+                c.validate(),
+                Err(ConfigError::InvalidTldCharset(hostile.to_string())),
+                "tld {hostile:?} must be rejected by the charset guard"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_plain_dns_label_tld() {
+        for ok in ["dig", "web3", "my-tld", "a1b2"] {
+            let c = Config {
+                tld: ok.to_string(),
+                ..Config::default()
+            };
+            assert_eq!(c.validate(), Ok(()), "tld {ok:?} is a valid DNS label");
+        }
+    }
+
+    #[test]
+    fn is_safe_tld_matches_the_dns_label_charset() {
+        assert!(is_safe_tld("dig"));
+        assert!(is_safe_tld("web3-x"));
+        assert!(!is_safe_tld(""));
+        assert!(!is_safe_tld("has space"));
+        assert!(!is_safe_tld("quote'"));
+        assert!(!is_safe_tld("slash/"));
+        assert!(!is_safe_tld("dot.dot"));
     }
 }

@@ -96,6 +96,14 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Query the running service's machine-readable health (the same object the gateway serves at
+    /// `GET /.dig/health`: version, bound port, listeners, node reachability). Exits non-zero when
+    /// nothing is serving. The CLI counterpart of the HTTP control endpoint (§6.2 parity).
+    Health {
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Resolve a single `.dig` resource through the gateway pipeline and print it. Accepts a
     /// bare host (`<label>.dig`), a `host/path`, or a full `http://<label>.dig/path` URL.
     Fetch {
@@ -247,6 +255,7 @@ where
         | Command::Start { .. }
         | Command::Stop { .. }
         | Command::Status { .. }
+        | Command::Health { .. }
         | Command::ConfigureOs { .. }
         | Command::UnconfigureOs { .. } => {
             Err("this command runs via the binary entrypoint, not execute()".to_string())
@@ -453,6 +462,24 @@ pub fn run() -> std::process::ExitCode {
                 Err(e) => return fail(&e),
             };
             match crate::service::status(&cfg) {
+                Ok(out) => {
+                    let serving = out.json["serving"].as_bool().unwrap_or(false);
+                    print_service_outcome(&out, *json);
+                    if serving {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    }
+                }
+                Err(e) => fail(&e.to_string()),
+            }
+        }
+        Command::Health { json } => {
+            let cfg = match load_config(None) {
+                Ok(c) => c,
+                Err(e) => return fail(&e),
+            };
+            match crate::service::health(&cfg) {
                 Ok(out) => {
                     let serving = out.json["serving"].as_bool().unwrap_or(false);
                     print_service_outcome(&out, *json);

@@ -234,6 +234,13 @@ Reserved under every `.dig` host AND directly on the loopback IP:
 These endpoints MUST be answerable even when the host label is invalid/absent (they describe
 the service, not a store).
 
+**CLI parity (§6.2, dig_ecosystem #569).** Every read-only control endpoint has a matching CLI
+verb so the same state is obtainable from the command line, not only over HTTP: `GET /.dig/health`
+↔ `dig-dns health` (fetches the running service's health object over loopback and prints it, with
+`--json`); `GET /.dig/proxy.pac` ↔ `dig-dns pac`; `GET /.dig/resolve-probe` ↔ the liveness probe
+`dig-dns status` performs. dig-dns exposes NO other RPC/control surface (it is an RPC *client* of a
+dig-node; it hosts only these loopback HTTP endpoints).
+
 ---
 
 ## 5. Security constraints (HARD)
@@ -260,6 +267,22 @@ the service, not a store).
   returned. A verification or decryption failure MUST NOT serve bytes.
 - **No secrets.** `dig-dns` handles no private keys and no wallet material; it serves only
   public store content (public stores decrypt from the URN alone — no secret salt, §8).
+- **Trusted absolute system-tool paths (defense-in-depth, #657).** Every OS tool `dig-dns` spawns
+  while elevated — `sc`/`net`/`systemctl`/`launchctl`/`id`/`powershell`/`reg` (service registration,
+  `configure-os`) and the read-only `doctor` probes — is invoked by its ABSOLUTE path (Windows:
+  under the real system directory from `GetSystemDirectoryW`; Unix: the canonical `/usr/bin`-family
+  location), never a bare name, so a search-order-planted binary in an attacker-controlled working
+  directory cannot hijack the privileged process.
+- **TLD charset guard (defense-in-depth, #538).** The configured TLD MUST match `^[a-z0-9-]+$`
+  (a DNS label) and is REJECTED at config load otherwise. The TLD flows unescaped into elevated
+  OS-resolver builders (the NRPT PowerShell single-quoted argument, the macOS `/etc/resolver`
+  PATH, systemd/NetworkManager drop-in bodies); confining it to the DNS-label charset keeps a
+  metacharacter (`'`, `/`, `..`, a newline, a shell separator) out of those elevated contexts.
+- **Symlink-safe atomic `/etc` writes (defense-in-depth, #650).** Every root-owned policy/resolver
+  file `configure-os` writes under `/etc/**` on Linux is written via a sibling temp file opened
+  `O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW`, `fsync`'d, then `rename`'d over the target — so a reader
+  never observes a half-written file and a pre-seeded symlink at the target can never redirect the
+  privileged write.
 
 The IPv6-first rule (CLAUDE.md §5.2) targets peer↔peer node comms; `dig-dns`'s listeners are
 deliberately IPv4 loopback (`127.0.0.5`) local endpoints and are out of that rule's scope.
@@ -383,7 +406,7 @@ endpoint, a CLI flag). Values are validated on load; an invalid value is a start
 | DNS port | `53` | `DIG_DNS_DNS_PORT` | UDP + TCP |
 | HTTP port | `80` | `DIG_DNS_HTTP_PORT` | primary |
 | HTTP fallback port | `8053` | `DIG_DNS_HTTP_FALLBACK_PORT` | used when `:80` is held |
-| TLD | `dig` | `DIG_DNS_TLD` | normalised: trim, strip leading `.`, lowercase |
+| TLD | `dig` | `DIG_DNS_TLD` | normalised (trim, strip leading `.`, lowercase) then validated against `^[a-z0-9-]+$` — a TLD with any other character is REJECTED at load (§5, #538) |
 | DNS TTL (s) | `2` | `DIG_DNS_TTL` | 1–5 |
 | node endpoint override | (ladder) | `DIG_NODE_URL` | empty ⇒ use the §6.3 ladder |
 | `dig.local` bind IP | `127.0.0.2` | `DIG_DNS_LOCAL_IP` | MUST be `127.0.0.0/8`; matches the installer's `dig.local` hosts registration (#91) and dig-node's own best-effort bind (§12) |
@@ -562,16 +585,30 @@ interchangeable and idempotent (the clean-reinstall, §13.2, makes a re-run safe
 - The **service id** is a reverse-DNS name used VERBATIM as the Windows SCM service name
   (`sc create`/`query`/`start`/`stop`/`delete`) and the launchd plist label. It MUST match the
   sibling convention `net.dignetwork.dig-node` used by the dig-node service.
-- **systemd unit filename — two registration paths, two names.** The native `.deb` package
-  (§14) ships its OWN unit file at the fixed path `/lib/systemd/system/net.dignetwork.dig-dns.service`
-  — the service id used verbatim. `dig-dns install`'s systemd registration goes through the
-  `service_manager` crate instead, which names the unit file with `ServiceLabel::to_script_name()`
-  (`{organization}-{application}`, i.e. `dignetwork-dig-dns.service`) rather than the qualified id
-  — it DROPS the `net` qualifier and joins with `-`, not `.`. Both paths register the SAME program
-  (`dig-dns serve`) and are functionally interchangeable (§13, §13.2's clean-reinstall still
-  applies to the CLI path), but a script/monitoring tool addressing the unit by name must use the
-  name matching HOW it was installed. `src/service.rs::query_installed`'s Linux probe resolves
-  the `dignetwork-dig-dns.service` form to match what it actually registers (dig_ecosystem #502).
+- **systemd unit filename — ONE canonical name across both registration paths (dig_ecosystem
+  #523).** The systemd unit file is named `net.dignetwork.dig-dns.service` — the service id used
+  verbatim — regardless of HOW it was installed:
+  - the native `.deb` package (§14) ships its unit at `/lib/systemd/system/net.dignetwork.dig-dns.service`
+    (the package-vendor unit dir);
+  - `dig-dns install` writes the unit at `/etc/systemd/system/net.dignetwork.dig-dns.service` (the
+    machine-administrator unit dir, which takes precedence if both ever coexist).
+
+  Both use the SAME unit NAME, so `systemctl … net.dignetwork.dig-dns` addresses one service
+  however it was installed, and a monitoring tool needs only one name. The CLI Linux path does NOT
+  go through the `service_manager` crate (whose `ServiceLabel::to_script_name()` named the unit
+  `dignetwork-dig-dns.service`, dropping the `net` qualifier and diverging from the `.deb`); it
+  manages the canonical-named unit file directly (`src/service.rs`, the Linux `SystemServiceBackend`
+  + `systemctl daemon-reload`/`enable`/`start`). This supersedes the prior two-names note (#502).
+- **Linux install is SYSTEM-level and requires root (#523/#528).** The unit is written under
+  `/etc/systemd/system` and binds the privileged loopback ports `:53`/`:80`, which a user-domain
+  unit cannot; `dig-dns install`/`uninstall` therefore require root (re-run with `sudo`) on Linux,
+  matching the `.deb`. The service runs as root with a bounded capability set —
+  `AmbientCapabilities`/`CapabilityBoundingSet=CAP_NET_BIND_SERVICE`, `NoNewPrivileges`,
+  `ProtectSystem=full`, `ProtectHome`, `PrivateTmp` — and NO dedicated `User=`/`DynamicUser=`, so
+  its `ExecStart` can reach the binary in ANY install dir (including a `0750` home like `~/.dig/bin`)
+  without the `203/EXEC` traversal failure a restricted service account hits (#528). macOS remains a
+  user-domain launchd agent (no elevation required); Windows remains system-scope SCM (elevation
+  required).
 - The **display name** is the human-friendly name shown in the Windows Services console. On
   Windows it is set with `sc config <id> displayname= "DIG NETWORK: DNS"` AFTER create (the
   underlying `sc create` sets the display name to the id). On launchd/systemd the service id is
@@ -603,14 +640,15 @@ launchd `bootout`/`bootstrap`; Linux systemd `stop`+`disable` then reinstall the
 | `dig-dns uninstall` | Stop + deregister the service. Windows requires elevation. |
 | `dig-dns start` / `dig-dns stop` | Start / stop the registered service. |
 | `dig-dns status` | Report whether the resolver is serving (probes `GET /.dig/resolve-probe` on the bound port) + whether it is registered, PLUS the running service's `pid` and ACTUALLY-bound port read from the machine-wide runtime file (§13.5). Exits non-zero when nothing is serving. |
+| `dig-dns health` | Query the running service's machine-readable health — the same object served at `GET /.dig/health` (§4.7): version, bound port, listeners, node reachability. The CLI counterpart of the control endpoint (§6.2 parity, #569). Exits non-zero when nothing is serving. |
 | `dig-dns run-service` | (hidden, Windows only) The SCM protocol entrypoint the installed service launches; speaks `StartServiceCtrlDispatcher` and reports `SERVICE_RUNNING` before any startup work so the SCM does not kill it with error 1053 (§13.4). Behaves like `serve` off Windows. |
 | `dig-dns configure-os [--browser-policy]` | Wire OS-level `*.<tld>` resolution so names resolve system-wide (§15). An explicit admin action distinct from the serve runtime; needs elevation (root / Administrator). `--browser-policy` ALSO sets a Chrome/Edge managed DoH-off policy (opt-in; the packages do not pass it). |
 | `dig-dns unconfigure-os` | Reverse `configure-os` (§15): remove the marker-scoped resolver wiring this tool — or the legacy dig-installer — added, plus any managed browser policy it wrote. Needs elevation. |
 
-Every command supports `--json` (§10). Install level for the SERVICE (`install`): user-level (no
-elevation) on Linux/macOS; system-level on Windows. OS resolver configuration (`configure-os`,
-§15) ALWAYS needs elevation on every OS (it edits system resolver state); refusal is reported with
-a stable `needs_elevation: true` JSON field.
+Every command supports `--json` (§10). Install level for the SERVICE (`install`): system-level on
+Linux (root required, #523/#528) and Windows (Administrator); user-level (no elevation) on macOS.
+OS resolver configuration (`configure-os`, §15) ALWAYS needs elevation on every OS (it edits system
+resolver state); refusal is reported with a stable `needs_elevation: true` JSON field.
 
 **The `digd` alias binary (dig_ecosystem #548).** The crate builds a SECOND binary, `digd`, that
 is a first-class alias for `dig-dns`: `digd <args>` MUST behave identically to `dig-dns <args>` —
