@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.16.0] - 2026-08-22
+
+### Features
+- **build:** Publish linux-arm64 binaries and .deb, execution-proved natively (#25)
+
 ## [0.15.1] - 2026-07-16
 
 ### Bug Fixes
