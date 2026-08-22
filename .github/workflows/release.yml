@@ -29,7 +29,14 @@ permissions:
 
 jobs:
   # Resolve the version string the artifacts are stamped with: `X.Y.Z` from a `vX.Y.Z` tag, or a
-  # `g<shortsha>` build id for the manual canary (which never publishes).
+  # canary build id for the manual dispatch (which never publishes).
+  #
+  # The canary id MUST be valid SEMVER, not a bare `g<shortsha>`. build-binaries.yml derives the
+  # native packages' numeric version as `${VER%%-*}`, so a `g<sha>` id reached WiX verbatim and
+  # `wix build` rejected it (`WIX0108: 'g5416401' is not a valid version`) — the Windows leg failed
+  # on EVERY dispatch, which in turn skipped every job gated on the build. The canary was therefore
+  # structurally incapable of answering the one question it exists to ask. `0.0.0-canary.<sha>`
+  # strips to a WiX/pkgbuild-valid `0.0.0` while staying obviously unshippable.
   meta:
     name: Resolve version
     runs-on: ubuntu-latest
@@ -45,7 +52,7 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           else
-            echo "version=g$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+            echo "version=0.0.0-canary.$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           fi
 
   # Build every OS/arch + native package through the shared reusable workflow — the same build the

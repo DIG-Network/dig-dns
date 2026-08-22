@@ -753,7 +753,7 @@ runner OS and attaches it to the `vX.Y.Z` GitHub Release alongside the raw binar
 |---|---|---|---|---|---|
 | Windows | `dig-dns-<ver>-windows-x64.msi` | WiX (`wix/main.wxs`) | SCM `ServiceInstall`/`ServiceControl` | `C:\Program Files\DIG Network\DIG DNS\dig-dns.exe` | `C:\ProgramData\DigDns` |
 | macOS | `dig-dns-<ver>-macos-{arm64,x64}.pkg` | `pkgbuild`/`productbuild` (`packaging/macos`) | LaunchDaemon | `/usr/local/bin/dig-dns` | `/Library/Application Support/DigDns` |
-| Ubuntu | `dig-dns_<ver>_amd64.deb` | `cargo-deb` (`Cargo.toml` metadata + `packaging/linux`) | systemd unit | `/usr/bin/dig-dns` | `/var/lib/dig-dns` |
+| Ubuntu | `dig-dns_<ver>_{amd64,arm64}.deb` | `cargo-deb` (`Cargo.toml` metadata + `packaging/linux`) | systemd unit | `/usr/bin/dig-dns` | `/var/lib/dig-dns` |
 
 ### 14.1 Windows `.msi` (WiX)
 
@@ -800,7 +800,8 @@ runner OS and attaches it to the `vX.Y.Z` GitHub Release alongside the raw binar
   `[package.metadata.deb]` (alongside `[package.metadata.deb.systemd-units]`); without it the unit
   file is still installed but no postinst is generated, so the service would never be enabled or
   started (dig_ecosystem #525).
-- Control metadata is apt-correct + stable (`Package: dig-dns`, `Architecture: amd64`, auto-computed
+- Control metadata is apt-correct + stable (`Package: dig-dns`, `Architecture:` matching the build
+  architecture — `amd64` or `arm64`, auto-computed
   `Depends`, `Section: net`), so `apt.dig.net` ingests the release-asset `.deb` and GPG-signs it into
   the apt repo (#425).
 - The maintainer scripts (`packaging/linux/{postinst,prerm,postrm}`) each carry the `#DEBHELPER#`
@@ -989,8 +990,15 @@ GitHub **pre-release** — so a fresh nightly always exists regardless of a vers
 The cross-OS build lives once in `.github/workflows/build-binaries.yml` (`on: workflow_call`, inputs
 `version` + `ref`). Both `release.yml` (stable) and the nightly channel call it, so the two paths
 can never diverge. It builds `dig-dns` + the `digd` alias + the native `.msi`/`.pkg`/`.deb` for
-`windows-x64`, `linux-x64`, `macos-arm64`, and `macos-x64`, stamping the caller's `version` into
+`windows-x64`, `linux-x64`, `linux-arm64`, `macos-arm64`, and `macos-x64`, stamping the caller's `version` into
 each artifact filename.
+
+Linux ships on TWO architectures. `linux-arm64` is built NATIVELY on `ubuntu-24.04-arm`; it MUST NOT
+be cross-compiled, because the artifact a user installs MUST be one this pipeline has executed. An
+`linux-arm64` artifact MUST NOT be published unless the `verify-linux-arm64` job has, on native
+aarch64 hardware, (a) asserted the exact expected artifact set, (b) confirmed via the ELF header that
+each binary targets `ARM aarch64`, and (c) EXECUTED both `dig-dns` and `digd` inside a bare
+`ubuntu:24.04` image carrying no build toolchain. Both publish paths gate on that job.
 
 ### 16.5 RELEASE_TOKEN posture
 
