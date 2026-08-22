@@ -14,7 +14,12 @@
 #
 # dig-dns is a lean, pure-Rust binary (rustls TLS, no OpenSSL / wasmtime), so every target builds
 # without a cross C-toolchain. Canonical asset stems: `dig-dns-<ver>-<os-arch>[.exe|.msi|.pkg]`,
-# `digd-<ver>-<os-arch>[.exe]`, and the Debian-conventional `dig-dns_<ver>_amd64.deb`.
+# `digd-<ver>-<os-arch>[.exe]`, and the Debian-conventional `dig-dns_<ver>_<deb-arch>.deb`.
+#
+# LINUX SHIPS TWO ARCHITECTURES: `linux-x64` and, since dig_ecosystem #3123, `linux-arm64` — built
+# NATIVELY on `ubuntu-24.04-arm` and execution-proved by the `verify-linux-arm64` job below before
+# either caller may publish. Both Linux legs are therefore gated on `runner.os == 'Linux'` rather
+# than on a single runner label; a label-specific gate would silently skip the .deb on arm64.
 #
 # The gate runs fmt + clippy only — a PR's own CI (ci.yml) already ran the full
 # fmt/clippy/test/coverage set against the merged tree before merge (§2.4a); re-running the suite
@@ -76,6 +81,16 @@ jobs:
             bin: dig-dns
             out_name: linux-x64
             arch: x64
+          # NATIVE arm64 Linux — not cross-compiled. dig-dns is a public repo, so GitHub's
+          # `ubuntu-24.04-arm` hosted runners are available, and the label is already in production
+          # on dig-node, digs and dig-app. Building natively means the published artifact is the one
+          # the verify job below actually EXECUTES on real aarch64 hardware, rather than an
+          # unvalidated cross-compilation output (dig_ecosystem #3123 / #2126).
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bin: dig-dns
+            out_name: linux-arm64
+            arch: arm64
           - os: macos-14 # Apple silicon (arm64)
             target: aarch64-apple-darwin
             bin: dig-dns
@@ -196,7 +211,7 @@ jobs:
       # The .deb is an apt-correct release asset apt.dig.net ingests + GPG-signs (#425).
       # ---------------------------------------------------------------------------------------
       - name: Build Ubuntu .deb (cargo-deb)
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           cargo install cargo-deb --locked
@@ -212,7 +227,7 @@ jobs:
           dpkg-deb -c "$DEB"
 
       - name: Smoke-test the .deb (install → verify unit → remove)
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -eo pipefail
@@ -319,3 +334,125 @@ jobs:
           name: dig-dns-${{ matrix.out_name }}
           path: dist/*
           if-no-files-found: error
+
+  # ═══════════════════════════════════════════════════════════════════════════════════════════
+  # linux-arm64 is the target that has NEVER shipped (dig_ecosystem #3123 / #2126), so it is the
+  # one whose artifacts nobody has ever run. Publishing an arm64 file that does not start would be
+  # worse than the honest absence it replaces — an arm64 host would resolve an update, stage it,
+  # and land on a binary the loader kills. This job proves the three claims the release makes, on
+  # NATIVE aarch64 hardware, and `publish` cannot attach anything until it is green: both callers
+  # gate their publish job on this whole reusable workflow succeeding, and nothing here is
+  # `continue-on-error` or skippable.
+  #
+  # Scoped to arm64 deliberately: linux-x64/macOS/Windows have shipped for many releases and each
+  # already has an install smoke-test in the build job above. Widening execution-proof to those is
+  # a sensible follow-up, not a precondition for arm64 existing.
+  verify-linux-arm64:
+    name: verify linux-arm64 (native execution)
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Download the linux-arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dig-dns-linux-arm64
+          path: dist
+
+      # Asserted FIRST, and as an exact set: every later assertion loops over what is PRESENT, so a
+      # row that built the binaries but skipped the .deb leg would leave a short dist/ that the ELF
+      # and execution checks pass over in complete silence. Naming the expected stems also pins the
+      # exact strings dig-updater-feedsign's `expected_asset_name` searches for
+      # (`dig-dns-<ver>-linux-arm64`) — a rename here breaks the update path with no other signal.
+      - name: Assert the expected artifact set
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la dist
+          VER="${{ inputs.version }}"
+          expected=(
+            "dig-dns-${VER}-linux-arm64"
+            "digd-${VER}-linux-arm64"
+          )
+          for f in "${expected[@]}"; do
+            test -f "dist/$f" || { echo "MISSING expected artifact: $f"; exit 1; }
+          done
+          # cargo-deb names by the Debian convention with the DEBIAN arch token, and its revision
+          # suffix is not derived from $VER, so the .deb is matched by glob rather than by an exact
+          # name. Exactly one must exist and it must be arm64 — an amd64 .deb reaching this job
+          # would mean the build ran on the wrong architecture.
+          deb_count=$(ls dist/*.deb 2>/dev/null | wc -l)
+          test "$deb_count" -eq 1 || { echo "expected exactly 1 .deb, found $deb_count"; exit 1; }
+          DEB=$(ls dist/*.deb)
+          case "$DEB" in
+            *_arm64.deb) echo "arm64 .deb: $DEB" ;;
+            *) echo "the .deb is not arm64: $DEB"; exit 1 ;;
+          esac
+          # Nothing else may appear. A surprise file means a step produced something unreviewed.
+          actual_count=$(ls -1 dist | wc -l)
+          test "$actual_count" -eq 3 || { echo "expected exactly 3 artifacts, found $actual_count"; ls -1 dist; exit 1; }
+          echo "artifact set OK"
+
+      # Independent of execution, and the check that catches the NEAREST wrong build: a target-triple
+      # typo yielding an x86-64 ELF under a `-linux-arm64` name. Execution alone cannot see that —
+      # were the runner ever to carry binfmt/qemu registration, an x86-64 binary would run happily
+      # and every launch assertion below would pass. The ELF machine field cannot be emulated away.
+      - name: Assert each artifact is a real aarch64 ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in dist/dig-dns-* dist/digd-*; do
+            out=$(file -b "$f")
+            echo "$f => $out"
+            case "$out" in
+              *"ARM aarch64"*) ;;
+              *) echo "NOT an aarch64 ELF: $f ($out)"; exit 1 ;;
+            esac
+          done
+          # The .deb's payload is the same binary; verify the packaged copy too, so an apt install
+          # cannot deliver a different architecture than the raw asset the beacon delivers.
+          dpkg-deb -I dist/*.deb | grep -E '^ Architecture: arm64$' || { echo ".deb control says the wrong Architecture"; exit 1; }
+
+      # The execution proof. `--version` is the invocation because clap answers it and exits before
+      # any subcommand dispatch (`src/cli.rs` sets `version` on the root command), so it touches no
+      # config, no filesystem state, no :53/:80 bind and no network — isolating the only question
+      # this job exists to ask: does the dynamic loader resolve this binary on this architecture.
+      #
+      # A BARE `ubuntu:24.04` container is the fixture, not the runner's own filesystem. The runner
+      # has a full toolchain installed; a binary that had silently acquired a link against something
+      # the build environment happens to provide would start there and fail on a user's host. The
+      # absence of those libraries IS the fixture. dig-dns is pure-Rust with rustls (no OpenSSL, no
+      # wasmtime), so the only permitted dependency is libc.
+      - name: Execute both binaries on a bare arm64 ubuntu:24.04
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ inputs.version }}"
+          for stem in dig-dns digd; do
+            f="${stem}-${VER}-linux-arm64"
+            chmod +x "dist/$f"
+            echo "=== running $f --version ==="
+            docker run --rm --platform linux/arm64 \
+              -v "$PWD/dist:/dist:ro" ubuntu:24.04 \
+              "/dist/$f" --version
+          done
+          echo "both arm64 binaries executed on a bare ubuntu:24.04"
+
+      # The dynamic-link surface, recorded and asserted. A regression that pulls in a new shared
+      # library would still EXECUTE above if that library happened to exist in ubuntu:24.04's base
+      # image; this names what the binary is actually allowed to need.
+      - name: Assert the arm64 binary links only against libc
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ inputs.version }}"
+          NEEDED=$(readelf -d "dist/dig-dns-${VER}-linux-arm64" | grep NEEDED || true)
+          echo "$NEEDED"
+          while read -r line; do
+            [ -n "$line" ] || continue
+            lib=$(echo "$line" | sed -n 's/.*\[\(.*\)\].*/\1/p')
+            case "$lib" in
+              libc.so.*|libm.so.*|libgcc_s.so.*|ld-linux-aarch64.so.*|libdl.so.*|libpthread.so.*|librt.so.*) ;;
+              *) echo "unexpected shared-library dependency on a pure-Rust binary: $lib"; exit 1 ;;
+            esac
+          done <<< "$NEEDED"
+          echo "link surface OK"
