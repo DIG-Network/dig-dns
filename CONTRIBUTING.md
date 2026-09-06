@@ -69,15 +69,13 @@ right place to let them run.
 - `main` is protected: every GitHub Flow PR must have all required checks green (Rustfmt,
   Clippy, Test + coverage, Build, plus the version-increment and commitlint gates) and every
   review thread resolved before it can be squash-merged. No direct pushes to `main`.
-- **Releases are cron-driven, not merge-driven.** `.github/workflows/nightly-release.yml` runs
-  at midnight UTC and also accepts a manual `workflow_dispatch`. Verified directly from this
-  repo's own workflow file rather than assumed from the ecosystem default: the `stable` job's
-  condition is
-  `github.event_name == 'schedule' || inputs.channel == 'stable' || inputs.channel == 'both'`
-  — so **the midnight cron cuts a real stable `vX.Y.Z` release automatically** whenever
-  `Cargo.toml`'s version has changed since the last tag (it's a no-op otherwise), it isn't
-  gated behind a manual dispatch. The same run also publishes a nightly pre-release
-  (`nightly-YYYYMMDD` + a rolling `nightly` tag) unconditionally, built from `main` HEAD. In
-  practice this means: once your PR merges with a bumped version, the very next midnight cron
-  publishes it as a stable release without further action — merge only versions you're ready
-  to ship.
+- **Releases are cut by manual dispatch only — never automatically.** `nightly-release.yml`'s
+  `stable` job runs ONLY on a manual `workflow_dispatch(channel: stable|both)` (CLAUDE.md §3.6-A) —
+  the midnight-UTC cron drives the nightly channel alone and can never cut a stable `vX.Y.Z` tag,
+  bumped version or not. So merging your PR with a bumped `Cargo.toml` version does nothing on its
+  own: someone dispatches `channel: stable` (or `both`) from Actions → **Nightly + stable release**
+  → Run workflow when it's time to ship (git-cliff regenerates `CHANGELOG.md`, commits, tags, and
+  pushes with `RELEASE_TOKEN`), which in turn fires `release.yml` (binary + native-package build).
+  Get the version bump and the gate right before merging — the dispatch is the deliberate step
+  after. The same cron run ALSO publishes a nightly pre-release (`nightly-YYYYMMDD` + a rolling
+  `nightly` tag) unconditionally, built from `main` HEAD — that part is unaffected.

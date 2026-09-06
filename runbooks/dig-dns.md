@@ -239,18 +239,18 @@ asset that `apt.dig.net` ingests + GPG-signs into the apt repo (#425).
 
 ## Deployment / release
 
-Releases are **NOT cut on merge to `main`**. They are batched via a **nightly cron at midnight UTC**
-plus **manual dispatch**. See `runbooks/release.md` for the full pipeline: stable (batched or on
-demand when `Cargo.toml` version is bumped) and nightly (pre-release, every night from `main` HEAD).
+Releases are **NOT cut on merge to `main`**, and stable is **NOT cut at midnight either** — the
+midnight cron drives the nightly channel only (CLAUDE.md §3.6-A). See `runbooks/release.md` for the
+full pipeline: stable is manual-dispatch-only; nightly is pre-release, every night from `main` HEAD.
 
 The nightly system orchestrates both channels via `.github/workflows/nightly-release.yml`:
-- **Stable** (`vX.Y.Z`): cut automatically at the next midnight when a new version is detected
-  (existing `vX.Y.Z` tag means idempotent no-op), or manually via **Actions → Nightly + stable
-  release → Run workflow → `channel: stable`**. Rebuilds CHANGELOG.md, commits `chore(release):
-  vX.Y.Z`, tags, and fires `.github/workflows/release.yml` to build binaries + native packages
-  (Windows `.msi`, two macOS `.pkg`s, Ubuntu `.deb`) and publish the stable GitHub Release.
+- **Stable** (`vX.Y.Z`): cut ONLY via **Actions → Nightly + stable release → Run workflow →
+  `channel: stable`** (an existing `vX.Y.Z` tag means an idempotent no-op if dispatched again).
+  Rebuilds CHANGELOG.md, commits `chore(release): vX.Y.Z`, tags, and fires
+  `.github/workflows/release.yml` to build binaries + native packages (Windows `.msi`, two macOS
+  `.pkg`s, Ubuntu `.deb`) and publish the stable GitHub Release.
 - **Nightly**: built every night from `main` as a pre-release under a rolling tag; kept for 14
-  nights.
+  nights. Also dispatchable on demand (`channel: nightly`).
 
 **Secrets:** `RELEASE_TOKEN` (repo or org secret, the ecosystem-wide release PAT) is required for
 both channels (no-ops with a warning if absent). **Verify a release:** per `runbooks/release.md`
