@@ -10,7 +10,7 @@
 # so it MUST live at the root and increase on every PR (CLAUDE.md §2.4 / §3.6).
 [package]
 name = "dig-dns"
-version = "0.16.2"
+version = "0.16.3"
 edition = "2021"
 description = "Local *.dig name resolution: a DNS responder + HTTP gateway resolving <storeId>.dig to DIG store content via a dig-node."
 license = "GPL-2.0-only"
@@ -173,6 +173,11 @@ windows-service = "0.7"
 # System32 path from the syscall, immune to a poisoned %SystemRoot% — the anti-search-order-hijack
 # base for every elevated bare-name spawn (sc/net/powershell/reg).
 windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
+
+# Compiles assets/dig.rc (the branded DIG icon) into a Windows resource, linked into every
+# `[[bin]]` in this crate by build.rs. See dig_ecosystem #2917.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
 
 [dev-dependencies]
 # `assert_cmd` + `predicates` drive the REAL built binaries (`dig-dns` AND the `digd` alias)
